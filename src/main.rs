@@ -1,49 +1,83 @@
 //! Interlace — a focused GUI wrapper around ffmpeg/ffprobe for remuxing media.
 //!
-//! Milestones 1–2 are the logic core with no UI: probe a file, build the default
-//! project (every source stream kept, in order), print the ffmpeg command, and
-//! optionally run it while streaming progress. The UI (eframe/egui) comes later.
+//! By default this launches the egui/eframe UI (milestone 3+). The logic-core
+//! CLI harness from milestones 1–2 is preserved behind flags:
+//!   interlace                      launch the UI
+//!   interlace <file>               launch the UI, preloaded with <file>
+//!   interlace <file> --print       print the ffmpeg command and exit (no UI)
+//!   interlace <file> --run [--out] run it, streaming progress, and exit (no UI)
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod args;
 mod model;
 mod probe;
 mod run;
+mod ui;
 
 use model::Project;
 use run::RunUpdate;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::ExitCode;
 
-fn main() -> ExitCode {
-    // usage: interlace <media-file> [--run] [--out <path>]
+fn main() -> eframe::Result {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+
+    // CLI escape hatch: keep the milestone 1–2 behavior for scripting/testing.
+    if argv.iter().any(|a| a == "--print" || a == "--run") {
+        std::process::exit(cli(&argv));
+    }
+
+    // GUI: optionally preload the first non-flag argument as a file.
+    let initial = argv.iter().find(|a| !a.starts_with("--")).map(PathBuf::from);
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([780.0, 720.0])
+            .with_min_inner_size([560.0, 480.0])
+            .with_title("Interlace"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Interlace",
+        options,
+        Box::new(|cc| {
+            let mut app = ui::InterlaceApp::new(cc);
+            if let Some(path) = initial {
+                app.load_file(path);
+            }
+            Ok(Box::new(app))
+        }),
+    )
+}
+
+// --- CLI harness (milestones 1–2) --------------------------------------------
+
+/// Returns a process exit code.
+fn cli(argv: &[String]) -> i32 {
     let mut file: Option<String> = None;
     let mut out: Option<String> = None;
     let mut do_run = false;
-    let mut argv = std::env::args().skip(1);
-    while let Some(arg) = argv.next() {
+    let mut it = argv.iter();
+    while let Some(arg) = it.next() {
         match arg.as_str() {
             "--run" => do_run = true,
-            "--out" => out = argv.next(),
-            _ => file = Some(arg),
+            "--print" => {} // print is implicit below
+            "--out" => out = it.next().cloned(),
+            _ => file = Some(arg.clone()),
         }
     }
     let Some(file) = file else {
-        eprintln!("usage: interlace <media-file> [--run] [--out <path>]");
-        eprintln!("  (default)    probe the file and print the ffmpeg remux command");
-        eprintln!("  --run        also run it, streaming progress");
-        eprintln!("  --out <path> override the output path (e.g. to a different container)");
-        return ExitCode::FAILURE;
+        eprintln!("usage: interlace <media-file> [--print] [--run] [--out <path>]");
+        return 1;
     };
 
-    // PATH-first resolution; a configurable override + startup detection is M5.
     let (ffprobe, ffmpeg) = ("ffprobe", "ffmpeg");
-
     let mut project = match Project::from_input(ffprobe, &PathBuf::from(&file)) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {e}");
-            return ExitCode::FAILURE;
+            return 1;
         }
     };
     if let Some(out) = out {
@@ -56,19 +90,16 @@ fn main() -> ExitCode {
         println!("→ output: {}", project.output.display());
         return execute(ffmpeg, &project);
     }
-    ExitCode::SUCCESS
+    0
 }
 
-/// Run the project and render progress to the terminal, returning a process
-/// exit code that reflects success or failure.
-fn execute(ffmpeg: &str, project: &Project) -> ExitCode {
-    // No UI yet to confirm overwrite, so allow it for the CLI demo. The run
-    // layer still pre-checks when overwrite is false.
+/// Run the project and render progress to the terminal.
+fn execute(ffmpeg: &str, project: &Project) -> i32 {
     let updates = match run::run(ffmpeg, project, true) {
         Ok(rx) => rx,
         Err(e) => {
             eprintln!("error: {e}");
-            return ExitCode::FAILURE;
+            return 1;
         }
     };
 
@@ -84,7 +115,6 @@ fn execute(ffmpeg: &str, project: &Project) -> ExitCode {
                     .total_size
                     .map(|b| format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0)))
                     .unwrap_or_else(|| "?".into());
-                // `\r` keeps it on one updating line.
                 print!(
                     "\r  {pct}  t={:>7.1}s  speed={speed}  size={size}   ",
                     p.out_time_secs
@@ -96,17 +126,17 @@ fn execute(ffmpeg: &str, project: &Project) -> ExitCode {
                 return match result {
                     Ok(()) => {
                         println!("done.");
-                        ExitCode::SUCCESS
+                        0
                     }
                     Err(f) => {
                         let code = f.code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
                         eprintln!("ffmpeg failed (exit {code}):");
                         eprintln!("{}", f.stderr_tail);
-                        ExitCode::FAILURE
+                        1
                     }
                 };
             }
         }
     }
-    ExitCode::SUCCESS
+    0
 }
