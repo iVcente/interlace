@@ -13,6 +13,7 @@ mod model;
 mod probe;
 mod run;
 mod ui;
+mod validate;
 
 use model::Project;
 use run::RunUpdate;

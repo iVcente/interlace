@@ -44,6 +44,10 @@ pub struct InterlaceApp {
     pub(crate) run_state: RunState,
     /// Set when Run is pressed but the output already exists — drives a modal.
     pub(crate) pending_overwrite: bool,
+    /// The command-bar escape hatch. `None` means "follow the model" (the bar
+    /// mirrors `to_args()` live); `Some` means the user has edited it, so Run
+    /// executes this text verbatim instead. Reset to `None` on load or "Reset".
+    pub(crate) command_edit: Option<String>,
     pub(crate) ffprobe: String,
     pub(crate) ffmpeg: String,
 }
@@ -60,6 +64,7 @@ impl InterlaceApp {
             error: None,
             run_state: RunState::Idle,
             pending_overwrite: false,
+            command_edit: None,
             ffprobe: "ffprobe".into(),
             ffmpeg: "ffmpeg".into(),
         }
@@ -73,6 +78,8 @@ impl InterlaceApp {
                 self.project = Some(project);
                 self.error = None;
                 self.run_state = RunState::Idle;
+                self.command_edit = None; // a new file starts from the model
+
             }
             Err(e) => self.error = Some(e),
         }
@@ -135,12 +142,29 @@ impl InterlaceApp {
         if matches!(self.run_state, RunState::Running { .. }) {
             return;
         }
+        // Escape hatch: an edited command runs verbatim, bypassing the model
+        // (and thus the model-based overwrite pre-check — the user owns `-y`).
+        if let Some(command) = self.command_edit.clone() {
+            self.start_run_edited(&command);
+            return;
+        }
         let Some(p) = &self.project else { return };
         if p.output.exists() {
             self.pending_overwrite = true;
         } else {
             self.start_run(false);
         }
+    }
+
+    /// Run a user-edited command string. Tokenizes it, drops a leading `ffmpeg`
+    /// program token (the configured binary is authoritative), and runs the rest.
+    pub(crate) fn start_run_edited(&mut self, command: &str) {
+        let args = command_args(command);
+        let duration = self.project.as_ref().and_then(|p| p.duration_secs);
+        self.run_state = match run::run_raw(&self.ffmpeg, args, duration) {
+            Ok(rx) => RunState::Running { rx, fraction: 0.0, line: "starting…".into() },
+            Err(e) => RunState::Done { ok: false, line: e },
+        };
     }
 
     fn start_run(&mut self, overwrite: bool) {
@@ -261,6 +285,21 @@ impl eframe::App for InterlaceApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.render(ui);
     }
+}
+
+/// Turn an edited command line into ffmpeg argv: tokenize, then drop a leading
+/// `ffmpeg` / `ffmpeg.exe` program token so the configured binary stays in
+/// charge (the user edits the *arguments*, not which executable we launch).
+fn command_args(command: &str) -> Vec<String> {
+    let mut args = run::tokenize(command);
+    let leads_with_ffmpeg = args
+        .first()
+        .map(|a| a.eq_ignore_ascii_case("ffmpeg") || a.to_lowercase().ends_with("ffmpeg.exe"))
+        .unwrap_or(false);
+    if leads_with_ffmpeg {
+        args.remove(0);
+    }
+    args
 }
 
 fn progress_line(p: &run::Progress) -> String {
@@ -459,6 +498,26 @@ mod tests {
             app.project.as_ref().unwrap().streams[0].encode,
             Encode::Copy
         ));
+    }
+
+    #[test]
+    fn command_args_strips_leading_ffmpeg_program_token() {
+        assert_eq!(
+            command_args(r#"ffmpeg -i "a b.mkv" -c copy out.mkv"#),
+            vec!["-i", "a b.mkv", "-c", "copy", "out.mkv"]
+        );
+        // Case/extension variants of the program token are stripped too.
+        assert_eq!(command_args("FFMPEG.exe -version"), vec!["-version"]);
+        // A command that doesn't start with ffmpeg is passed through as-is.
+        assert_eq!(command_args("-i in.mkv"), vec!["-i", "in.mkv"]);
+    }
+
+    #[test]
+    fn renders_edited_command_bar_without_panicking() {
+        let mut app = app_with_demo();
+        app.command_edit = Some("ffmpeg -i in.mkv -c copy out.mkv".into());
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
 
     #[test]

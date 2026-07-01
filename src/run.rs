@@ -77,6 +77,36 @@ pub fn run(
     }
     args.extend(project.to_args());
 
+    spawn(ffmpeg, args, project.duration_secs)
+}
+
+/// Run a user-edited command verbatim — the "escape hatch". `args` are the
+/// tokens *after* the program name (see [`tokenize`]); the caller supplies the
+/// ffmpeg binary, so the configured path still wins over whatever program name
+/// the user typed. We prepend only the flags needed to drive the progress bar
+/// and keep ffmpeg from blocking on input — everything else (including `-y` and
+/// the output path) is left exactly as the user wrote it.
+pub fn run_raw(
+    ffmpeg: &str,
+    user_args: Vec<String>,
+    duration: Option<f64>,
+) -> Result<Receiver<RunUpdate>, String> {
+    if user_args.is_empty() {
+        return Err("the edited command is empty".into());
+    }
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-progress".into(),
+        "pipe:1".into(),
+    ];
+    args.extend(user_args);
+    spawn(ffmpeg, args, duration)
+}
+
+/// Launch ffmpeg with the fully-assembled `args` and stream updates back.
+/// Shared by [`run`] (model-driven) and [`run_raw`] (escape hatch).
+fn spawn(ffmpeg: &str, args: Vec<String>, duration: Option<f64>) -> Result<Receiver<RunUpdate>, String> {
     let mut cmd = Command::new(ffmpeg);
     cmd.args(&args)
         .stdin(Stdio::null())
@@ -90,7 +120,6 @@ pub fn run(
 
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
-    let duration = project.duration_secs;
 
     // Drain stderr on its own thread so a full pipe can't deadlock the child.
     let stderr_handle = thread::spawn(move || read_to_lines(stderr));
@@ -120,6 +149,47 @@ pub fn run(
     });
 
     Ok(rx)
+}
+
+/// Split a command line into argv tokens, honoring `'…'` and `"…"` quoting so a
+/// path with spaces survives as one token. Backslashes are kept literal (Windows
+/// paths are the common case), so there's no escape processing. An empty quoted
+/// string `""` yields an empty token.
+pub fn tokenize(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+
+    for c in input.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None; // close the quote; token may continue
+                } else {
+                    cur.push(c);
+                }
+            }
+            None => {
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                    in_token = true; // even `""` is a (empty) token
+                } else if c.is_whitespace() {
+                    if in_token {
+                        out.push(std::mem::take(&mut cur));
+                        in_token = false;
+                    }
+                } else {
+                    cur.push(c);
+                    in_token = true;
+                }
+            }
+        }
+    }
+    if in_token {
+        out.push(cur);
+    }
+    out
 }
 
 /// Accumulates the `key=value` lines of one progress block until its terminating
@@ -262,5 +332,31 @@ progress=end\n";
     fn tail_keeps_last_nonempty_lines() {
         let lines: Vec<String> = ["a", "", "b", "c", ""].iter().map(|s| s.to_string()).collect();
         assert_eq!(tail(&lines, 2), "b\nc");
+    }
+
+    #[test]
+    fn tokenize_keeps_quoted_spaces_together() {
+        assert_eq!(
+            tokenize(r#"-i "my movie.mkv" -map 0:a:1"#),
+            vec!["-i", "my movie.mkv", "-map", "0:a:1"]
+        );
+    }
+
+    #[test]
+    fn tokenize_treats_backslashes_as_literal() {
+        // A Windows path must survive unescaped and unsplit when quoted.
+        assert_eq!(
+            tokenize(r#"-i "C:\Media\The Film.mkv""#),
+            vec!["-i", r"C:\Media\The Film.mkv"]
+        );
+        // Unquoted backslash path stays intact too.
+        assert_eq!(tokenize(r"-i C:\a\b.mkv"), vec!["-i", r"C:\a\b.mkv"]);
+    }
+
+    #[test]
+    fn tokenize_handles_single_quotes_and_empties() {
+        assert_eq!(tokenize("-metadata title='Le Film'"), vec!["-metadata", "title=Le Film"]);
+        assert_eq!(tokenize(r#"-metadata title="""#), vec!["-metadata", "title="]);
+        assert_eq!(tokenize("   "), Vec::<String>::new());
     }
 }
