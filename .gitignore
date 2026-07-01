@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target
+
+# rustfmt backups
+**/*.rs.bk
+
+# MSVC debug symbols
+*.pdb
+
+# Editor / IDE
+.vscode/
+.idea/
+*.iml
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Note: Cargo.lock IS committed — Interlace is a binary application.
