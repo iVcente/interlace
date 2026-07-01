@@ -1,99 +1,180 @@
-//! The inspector: the selected row's fields shown as a form. In M3 the widgets
-//! are **disabled previews** (they display the model but don't mutate it) — the
-//! table row and inspector are the same object shown two ways. Wiring the edits
-//! back into the model is M4.
+//! The inspector: the selected row's fields as an editable form. Edits write
+//! straight back into `project.streams[selected]` — the table row and inspector
+//! are the same object shown two ways.
+//!
+//! `language`/`title` map an empty field to `None` (inherit the original tag
+//! through the copy). The convert controls switch a stream between `Encode::Copy`
+//! and `Encode::Audio` and tune its codec/bitrate/channels.
 
 use super::{InterlaceApp, card, section_label};
-use crate::model::{Encode, OutStream};
+use crate::model::{Encode, Kind, OutStream};
 
-pub(super) fn show(ui: &mut egui::Ui, app: &InterlaceApp) {
+const CODECS: [&str; 6] = ["copy", "aac", "ac3", "opus", "flac", "mp3"];
+const BITRATES: [u32; 6] = [96, 128, 160, 192, 256, 320];
+const CHANNELS: [(Option<u32>, &str); 4] = [
+    (None, "source"),
+    (Some(1), "1 (mono)"),
+    (Some(2), "2 (stereo)"),
+    (Some(6), "6 (5.1)"),
+];
+
+pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     card(ui, |ui| {
-        let Some((idx, stream)) = selected_stream(app) else {
+        let Some(idx) = app.selected else {
             section_label(ui, "INSPECTOR");
             ui.add_space(4.0);
             ui.weak("Select a stream to edit its language, title, flags, and conversion.");
             return;
         };
+        let Some(project) = app.project.as_mut() else { return };
+        if idx >= project.streams.len() {
+            return;
+        }
+
+        // Compute the type-relative index before taking the &mut borrow.
+        let kind = project.streams[idx].source.kind;
+        let type_rel = project.streams[..idx]
+            .iter()
+            .filter(|s| s.source.kind == kind)
+            .count();
+        let stream = &mut project.streams[idx];
 
         section_label(
             ui,
             &format!(
                 "INSPECTOR · {} {} (SELECTED)",
-                super::kind_text(stream.source.kind).to_uppercase(),
-                type_relative_index(app, idx)
+                super::kind_text(kind).to_uppercase(),
+                type_rel
             ),
         );
         ui.add_space(6.0);
 
-        // Everything here is disabled in M3: a faithful preview, not yet editable.
-        ui.add_enabled_ui(false, |ui| {
-            egui::Grid::new("inspector_fields")
-                .num_columns(4)
-                .spacing([16.0, 8.0])
-                .show(ui, |ui| {
-                    labeled(ui, "language", || {});
-                    labeled(ui, "title", || {});
-                    labeled(ui, "convert to", || {});
-                    labeled(ui, "bitrate", || {});
-                    ui.end_row();
-
-                    let mut lang = stream.meta.language.clone().unwrap_or_default();
-                    ui.add(egui::TextEdit::singleline(&mut lang).desired_width(90.0));
-
-                    let mut title = stream.meta.title.clone().unwrap_or_default();
-                    ui.add(egui::TextEdit::singleline(&mut title).desired_width(160.0));
-
-                    let (mut convert, mut bitrate) = convert_fields(stream);
-                    ui.add(egui::TextEdit::singleline(&mut convert).desired_width(90.0));
-                    ui.add(egui::TextEdit::singleline(&mut bitrate).desired_width(90.0));
-                    ui.end_row();
-                });
-
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let mut default = stream.meta.default;
-                ui.checkbox(&mut default, "default");
-                let mut forced = stream.meta.forced;
-                ui.checkbox(&mut forced, "forced");
+        ui.horizontal(|ui| {
+            field(ui, "language", |ui| {
+                let mut lang = stream.meta.language.clone().unwrap_or_default();
+                if ui
+                    .add(egui::TextEdit::singleline(&mut lang).desired_width(84.0))
+                    .changed()
+                {
+                    let lang = lang.trim().to_string();
+                    stream.meta.language = (!lang.is_empty()).then_some(lang);
+                }
             });
+            field(ui, "title", |ui| {
+                let mut title = stream.meta.title.clone().unwrap_or_default();
+                if ui
+                    .add(egui::TextEdit::singleline(&mut title).desired_width(200.0))
+                    .changed()
+                {
+                    stream.meta.title = (!title.is_empty()).then_some(title);
+                }
+            });
+            field(ui, "convert to", |ui| convert_combo(ui, stream, kind));
+            field(ui, "bitrate", |ui| bitrate_combo(ui, stream));
+            field(ui, "channels", |ui| channels_combo(ui, stream));
+        });
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut stream.meta.default, "default");
+            ui.checkbox(&mut stream.meta.forced, "forced");
         });
     });
 }
 
-fn selected_stream(app: &InterlaceApp) -> Option<(usize, &OutStream)> {
-    let project = app.project.as_ref()?;
-    let idx = app.selected?;
-    project.streams.get(idx).map(|s| (idx, s))
+/// A captioned field: small label above its widget, matching the mockup.
+fn field(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.vertical(|ui| {
+        ui.label(
+            egui::RichText::new(label)
+                .small()
+                .color(egui::Color32::from_gray(150)),
+        );
+        add(ui);
+    });
 }
 
-/// The stream's output index within its own type (a:0, a:1, s:3 …), matching
-/// how the serializer numbers it — computed by counting same-kind streams above.
-fn type_relative_index(app: &InterlaceApp, idx: usize) -> usize {
-    let Some(project) = app.project.as_ref() else {
-        return 0;
+fn convert_combo(ui: &mut egui::Ui, stream: &mut OutStream, kind: Kind) {
+    let is_audio = kind == Kind::Audio;
+    let current = match &stream.encode {
+        Encode::Copy => "copy".to_string(),
+        Encode::Audio { codec, .. } => codec.clone(),
     };
-    let kind = project.streams[idx].source.kind;
-    project.streams[..idx]
+    ui.add_enabled_ui(is_audio, |ui| {
+        egui::ComboBox::from_id_salt("convert_to")
+            .selected_text(&current)
+            .width(84.0)
+            .show_ui(ui, |ui| {
+                for opt in CODECS {
+                    if ui.selectable_label(current == opt, opt).clicked() {
+                        set_codec(stream, opt);
+                    }
+                }
+            });
+    });
+}
+
+fn bitrate_combo(ui: &mut egui::Ui, stream: &mut OutStream) {
+    // Only meaningful for a lossy audio conversion.
+    let Encode::Audio { codec, bitrate_kbps, .. } = &mut stream.encode else {
+        ui.add_enabled(false, egui::Button::new("—"));
+        return;
+    };
+    let lossy = codec != "flac";
+    let text = bitrate_kbps.map(|b| format!("{b}k")).unwrap_or_else(|| "auto".into());
+    ui.add_enabled_ui(lossy, |ui| {
+        egui::ComboBox::from_id_salt("bitrate")
+            .selected_text(text)
+            .width(84.0)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(bitrate_kbps.is_none(), "auto").clicked() {
+                    *bitrate_kbps = None;
+                }
+                for b in BITRATES {
+                    if ui.selectable_label(*bitrate_kbps == Some(b), format!("{b}k")).clicked() {
+                        *bitrate_kbps = Some(b);
+                    }
+                }
+            });
+    });
+}
+
+fn channels_combo(ui: &mut egui::Ui, stream: &mut OutStream) {
+    let Encode::Audio { channels, .. } = &mut stream.encode else {
+        ui.add_enabled(false, egui::Button::new("—"));
+        return;
+    };
+    let text = CHANNELS
         .iter()
-        .filter(|s| s.source.kind == kind)
-        .count()
+        .find(|(v, _)| v == channels)
+        .map(|(_, label)| *label)
+        .unwrap_or("source");
+    egui::ComboBox::from_id_salt("channels")
+        .selected_text(text)
+        .width(96.0)
+        .show_ui(ui, |ui| {
+            for (value, label) in CHANNELS {
+                if ui.selectable_label(*channels == value, label).clicked() {
+                    *channels = value;
+                }
+            }
+        });
 }
 
-fn convert_fields(stream: &OutStream) -> (String, String) {
-    match &stream.encode {
-        Encode::Copy => ("copy".into(), String::new()),
-        Encode::Audio { codec, bitrate_kbps, .. } => (
-            codec.clone(),
-            bitrate_kbps.map(|b| format!("{b}k")).unwrap_or_default(),
-        ),
+/// Switch a stream's encode to `codec` ("copy" reverts to stream-copy),
+/// preserving any bitrate/channels already chosen.
+fn set_codec(stream: &mut OutStream, codec: &str) {
+    if codec == "copy" {
+        stream.encode = Encode::Copy;
+        return;
     }
-}
-
-/// A small field caption (used for the grid's label row).
-fn labeled(ui: &mut egui::Ui, text: &str, _add: impl FnOnce()) {
-    ui.label(
-        egui::RichText::new(text)
-            .small()
-            .color(egui::Color32::from_gray(150)),
-    );
+    let (bitrate_kbps, channels) = match &stream.encode {
+        Encode::Audio { bitrate_kbps, channels, .. } => (*bitrate_kbps, *channels),
+        Encode::Copy => (Some(192), None),
+    };
+    stream.encode = Encode::Audio {
+        codec: codec.to_string(),
+        bitrate_kbps,
+        channels,
+    };
 }

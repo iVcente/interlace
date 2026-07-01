@@ -1,9 +1,9 @@
 //! The egui/eframe view layer.
 //!
-//! Milestone 3 is a **read-only** skeleton: load a probed file, render the
-//! sources bar, the stream table (with selection), a preview inspector, and the
-//! live generated command. Editing, drag-reorder, and wiring the Run button to
-//! `run.rs` are milestone 4 — the widgets for those are drawn here but inert.
+//! Milestone 4 makes it interactive: the inspector edits write back into the
+//! model, rows drag-to-reorder, remove/convert actions mutate the stream vec,
+//! and the Run button drives `run.rs` with a live progress bar. Extract and an
+//! editable command bar are milestone 5.
 //!
 //! `InterlaceApp` owns the whole session state; each screen region lives in its
 //! own submodule (`sources`, `table`, `inspector`, `command`) and is handed
@@ -14,8 +14,24 @@ mod inspector;
 mod sources;
 mod table;
 
-use crate::model::{Kind, Project};
+use crate::model::{Encode, Kind, Project};
+use crate::run::{self, RunUpdate};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
+
+/// The state of the current (or last) ffmpeg run.
+pub(crate) enum RunState {
+    Idle,
+    Running {
+        rx: Receiver<RunUpdate>,
+        fraction: f32,
+        line: String,
+    },
+    Done {
+        ok: bool,
+        line: String,
+    },
+}
 
 /// The whole application state.
 pub struct InterlaceApp {
@@ -25,14 +41,14 @@ pub struct InterlaceApp {
     pub(crate) selected: Option<usize>,
     /// Last error to surface (probe failure, etc.).
     pub(crate) error: Option<String>,
+    pub(crate) run_state: RunState,
+    /// Set when Run is pressed but the output already exists — drives a modal.
+    pub(crate) pending_overwrite: bool,
     pub(crate) ffprobe: String,
-    #[allow(dead_code)] // used once the Run button is wired (M4)
     pub(crate) ffmpeg: String,
 }
 
 impl InterlaceApp {
-    /// Construct empty. `CreationContext` is unused for now (default dark theme
-    /// is fine) but kept for when we customize fonts/visuals.
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self::empty()
     }
@@ -42,30 +58,145 @@ impl InterlaceApp {
             project: None,
             selected: None,
             error: None,
+            run_state: RunState::Idle,
+            pending_overwrite: false,
             ffprobe: "ffprobe".into(),
             ffmpeg: "ffmpeg".into(),
         }
     }
 
     /// Probe `path` and make it the current project, selecting the first stream.
-    /// A probe failure is surfaced rather than fatal.
     pub fn load_file(&mut self, path: PathBuf) {
         match Project::from_input(&self.ffprobe, &path) {
             Ok(project) => {
                 self.selected = (!project.streams.is_empty()).then_some(0);
                 self.project = Some(project);
                 self.error = None;
+                self.run_state = RunState::Idle;
             }
             Err(e) => self.error = Some(e),
         }
     }
 
+    // --- model mutations (called by the table/inspector after rendering) -----
+
+    pub(crate) fn remove_stream(&mut self, i: usize) {
+        let Some(p) = &mut self.project else { return };
+        if i >= p.streams.len() {
+            return;
+        }
+        p.streams.remove(i);
+        let len = p.streams.len();
+        self.selected = match self.selected {
+            _ if len == 0 => None,
+            Some(s) if s > i => Some(s - 1),
+            Some(s) if s == i => Some(i.min(len - 1)),
+            other => other, // s < i, or None
+        };
+    }
+
+    /// Toggle an audio stream between copy and a default AAC conversion.
+    pub(crate) fn toggle_convert(&mut self, i: usize) {
+        let Some(p) = &mut self.project else { return };
+        let Some(s) = p.streams.get_mut(i) else { return };
+        if s.source.kind != Kind::Audio {
+            return;
+        }
+        s.encode = match s.encode {
+            Encode::Copy => Encode::Audio {
+                codec: "aac".into(),
+                bitrate_kbps: Some(192),
+                channels: None,
+            },
+            Encode::Audio { .. } => Encode::Copy,
+        };
+        self.selected = Some(i);
+    }
+
+    /// Move the stream at `from` to insertion index `to` (0..=len), keeping the
+    /// moved stream selected. `to` is expressed in the pre-removal coordinate
+    /// space, as computed from the drop pointer position.
+    pub(crate) fn reorder(&mut self, from: usize, to: usize) {
+        let Some(p) = &mut self.project else { return };
+        if from >= p.streams.len() || to > p.streams.len() {
+            return;
+        }
+        let item = p.streams.remove(from);
+        let insert = if from < to { to - 1 } else { to };
+        let insert = insert.min(p.streams.len());
+        p.streams.insert(insert, item);
+        self.selected = Some(insert);
+    }
+
+    // --- running -------------------------------------------------------------
+
+    /// Called when Run is pressed: confirm overwrite if needed, else start.
+    pub(crate) fn on_run_clicked(&mut self) {
+        if matches!(self.run_state, RunState::Running { .. }) {
+            return;
+        }
+        let Some(p) = &self.project else { return };
+        if p.output.exists() {
+            self.pending_overwrite = true;
+        } else {
+            self.start_run(false);
+        }
+    }
+
+    fn start_run(&mut self, overwrite: bool) {
+        let Some(project) = self.project.clone() else { return };
+        self.run_state = match run::run(&self.ffmpeg, &project, overwrite) {
+            Ok(rx) => RunState::Running {
+                rx,
+                fraction: 0.0,
+                line: "starting…".into(),
+            },
+            Err(e) => RunState::Done { ok: false, line: e },
+        };
+    }
+
+    /// Drain progress updates each frame while a run is active.
+    fn poll_run(&mut self, ctx: &egui::Context) {
+        let RunState::Running { rx, fraction, line } = &mut self.run_state else {
+            return;
+        };
+        let mut finished: Option<(bool, String)> = None;
+        loop {
+            match rx.try_recv() {
+                Ok(RunUpdate::Progress(p)) => {
+                    if let Some(f) = p.fraction {
+                        *fraction = f as f32;
+                    }
+                    *line = progress_line(&p);
+                }
+                Ok(RunUpdate::Finished { result }) => {
+                    finished = Some(match result {
+                        Ok(()) => (true, "done".into()),
+                        Err(f) => (false, failure_line(&f)),
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some((false, "run ended unexpectedly".into()));
+                    break;
+                }
+            }
+        }
+        // Keep animating while a run is live (egui otherwise sleeps until input).
+        ctx.request_repaint();
+        if let Some((ok, line)) = finished {
+            self.run_state = RunState::Done { ok, line };
+        }
+    }
+
+    // --- frame ---------------------------------------------------------------
+
     /// Render one frame into the given root `Ui`. Split out from the trait method
     /// so it can be driven headlessly in tests via `Context::run_ui`.
-    ///
-    /// eframe 0.35 hands `App::ui` a bare root `Ui` with no background/margin, so
-    /// we wrap our content in a `CentralPanel` for the standard framed look.
     fn render(&mut self, ui: &mut egui::Ui) {
+        self.poll_run(ui.ctx());
+
         egui::CentralPanel::default().show(ui, |ui| {
             header(ui, self);
             ui.add_space(8.0);
@@ -85,6 +216,44 @@ impl InterlaceApp {
                 command::show(ui, self);
             });
         });
+
+        self.overwrite_modal(ui.ctx());
+    }
+
+    fn overwrite_modal(&mut self, ctx: &egui::Context) {
+        if !self.pending_overwrite {
+            return;
+        }
+        let path = self
+            .project
+            .as_ref()
+            .map(|p| p.output.display().to_string())
+            .unwrap_or_default();
+
+        let (mut start, mut cancel) = (false, false);
+        egui::Window::new("⚠ Output file exists")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("{path}\n\nOverwrite it?"));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Overwrite").clicked() {
+                        start = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if start {
+            self.pending_overwrite = false;
+            self.start_run(true);
+        } else if cancel {
+            self.pending_overwrite = false;
+        }
     }
 }
 
@@ -92,6 +261,22 @@ impl eframe::App for InterlaceApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.render(ui);
     }
+}
+
+fn progress_line(p: &run::Progress) -> String {
+    let pct = p
+        .fraction
+        .map(|f| format!("{:.0}%", f * 100.0))
+        .unwrap_or_else(|| "—".into());
+    let speed = p.speed.map(|s| format!("{s:.1}x")).unwrap_or_default();
+    format!("{pct}   ·   t={:.0}s   ·   {speed}", p.out_time_secs)
+}
+
+fn failure_line(f: &run::RunFailure) -> String {
+    // The last stderr line is almost always the actual error.
+    let last = f.stderr_tail.lines().last().unwrap_or("ffmpeg failed");
+    let code = f.code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+    format!("failed (exit {code}): {last}")
 }
 
 // --- header ------------------------------------------------------------------
@@ -193,7 +378,7 @@ pub(super) fn pick_media_file() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Encode, Meta, OutStream, Source};
+    use crate::model::{Meta, OutStream, Source};
 
     fn demo_project() -> Project {
         let mk = |input, index, kind, codec: &str, meta| OutStream {
@@ -221,25 +406,59 @@ mod tests {
         }
     }
 
-    /// Render a full frame headlessly with a populated project: exercises every
-    /// section's layout code and asserts it doesn't panic.
-    #[test]
-    fn renders_without_panicking() {
+    fn app_with_demo() -> InterlaceApp {
         let mut app = InterlaceApp::empty();
         app.project = Some(demo_project());
         app.selected = Some(1);
+        app
+    }
 
+    #[test]
+    fn renders_without_panicking() {
+        let mut app = app_with_demo();
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
 
-    /// The empty state (no file) must also render.
     #[test]
     fn renders_empty_state() {
         let mut app = InterlaceApp::empty();
         app.error = Some("something went wrong".into());
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
+    }
+
+    #[test]
+    fn reorder_moves_and_follows_selection() {
+        let mut app = app_with_demo();
+        // Move the subtitle (idx 2) to the top (insertion index 0).
+        app.reorder(2, 0);
+        let streams = &app.project.as_ref().unwrap().streams;
+        assert_eq!(streams[0].source.kind, Kind::Subtitle);
+        assert_eq!(app.selected, Some(0));
+    }
+
+    #[test]
+    fn remove_fixes_selection() {
+        let mut app = app_with_demo(); // selected = 1
+        app.remove_stream(0); // removing above selection shifts it down
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.project.as_ref().unwrap().streams.len(), 2);
+    }
+
+    #[test]
+    fn convert_toggles_audio_only() {
+        let mut app = app_with_demo();
+        app.toggle_convert(1); // audio → convert
+        assert!(matches!(
+            app.project.as_ref().unwrap().streams[1].encode,
+            Encode::Audio { .. }
+        ));
+        app.toggle_convert(0); // video → no-op
+        assert!(matches!(
+            app.project.as_ref().unwrap().streams[0].encode,
+            Encode::Copy
+        ));
     }
 
     #[test]

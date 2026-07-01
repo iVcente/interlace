@@ -1,24 +1,21 @@
 //! The command bar plus the run/progress footer.
 //!
-//! In M3 the command is a live, read-only render of `Project::to_args()` — the
-//! always-visible debugger the brief asks for. Making it editable (and parsing
-//! an edited string back into argv as the escape hatch) is M5; wiring the Run
-//! button and progress bar to `run.rs` is M4. Both are drawn here but inert.
+//! The command is a live, read-only render of `Project::to_args()` — the
+//! always-visible debugger the brief asks for. (Making it an editable escape
+//! hatch, with argv re-parsing, is M5.) The Run button and progress bar are now
+//! wired to `run.rs` via `InterlaceApp`'s run-state.
 
-use super::{InterlaceApp, card, section_label};
+use super::{InterlaceApp, RunState, card, section_label};
 
-pub(super) fn show(ui: &mut egui::Ui, app: &InterlaceApp) {
+pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     card(ui, |ui| {
-        section_label(ui, "COMMAND (EDITABLE)");
+        section_label(ui, "COMMAND (read-only — editable in M5)");
         ui.add_space(4.0);
 
         let mut text = match &app.project {
             Some(p) => format!("ffmpeg {}", p.to_args().join(" ")),
             None => String::new(),
         };
-
-        // Disabled in M3 (read-only preview). Becomes an editable escape hatch
-        // with argv re-parsing in M5.
         ui.add_enabled(
             false,
             egui::TextEdit::multiline(&mut text)
@@ -32,19 +29,46 @@ pub(super) fn show(ui: &mut egui::Ui, app: &InterlaceApp) {
     footer(ui, app);
 }
 
-fn footer(ui: &mut egui::Ui, app: &InterlaceApp) {
-    ui.horizontal(|ui| {
-        // Run button on the right; progress bar fills the rest on the left.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let has_project = app.project.is_some();
-            // Inert in M3: the button is drawn but does nothing until M4 wires it.
-            ui.add_enabled(false, egui::Button::new("▶ Run"))
-                .on_disabled_hover_text("Running is wired up in milestone 4");
+fn footer(ui: &mut egui::Ui, app: &mut InterlaceApp) {
+    let mut run_clicked = false;
 
-            let bar = egui::ProgressBar::new(0.0)
-                .desired_width(ui.available_width())
-                .text(if has_project { "idle" } else { "no file" });
-            ui.add(bar);
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let running = matches!(app.run_state, RunState::Running { .. });
+            let enabled = app.project.is_some() && !running;
+            let label = if running { "● Running…" } else { "▶ Run" };
+            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                run_clicked = true;
+            }
+
+            let (fraction, text, color) = progress_view(&app.run_state);
+            if let Some(color) = color {
+                // Surface a finished-run message beside the bar.
+                ui.colored_label(color, &text);
+            }
+            ui.add(
+                egui::ProgressBar::new(fraction)
+                    .desired_width(ui.available_width())
+                    .text(text),
+            );
         });
     });
+
+    if run_clicked {
+        app.on_run_clicked();
+    }
+}
+
+/// Map the run state to (bar fraction, bar text, optional side-message color).
+fn progress_view(state: &RunState) -> (f32, String, Option<egui::Color32>) {
+    match state {
+        RunState::Idle => (0.0, "idle".into(), None),
+        RunState::Running { fraction, line, .. } => (*fraction, line.clone(), None),
+        RunState::Done { ok: true, line } => {
+            (1.0, line.clone(), Some(egui::Color32::from_rgb(80, 200, 120)))
+        }
+        RunState::Done { ok: false, line } => {
+            (0.0, line.clone(), Some(egui::Color32::from_rgb(220, 80, 80)))
+        }
+    }
 }
