@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target
 
+# Packaging output
+/dist
+
 # rustfmt backups
 **/*.rs.bk
 

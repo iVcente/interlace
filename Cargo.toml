@@ -2,6 +2,9 @@
 name = "interlace"
 version = "0.1.0"
 edition = "2024"
+description = "A focused desktop GUI for remuxing media with ffmpeg — reorder, tag, remove, extract, and convert streams."
+authors = ["Vicente Danzmann"]
+readme = "README.md"
 
 [dependencies]
 eframe = "0.35.0"
@@ -10,6 +13,10 @@ rfd = "0.17.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 
+# Embeds the app icon and version metadata into the .exe on Windows.
+[build-dependencies]
+winresource = "0.1"
+
 # egui is an immediate-mode GUI: it re-lays out and re-paints the *entire* window
 # every frame. Unoptimized, that layout/paint/text-shaping work makes scrolling
 # visibly stutter. Optimizing dependencies (but not our own crate) gives near-
@@ -17,3 +24,11 @@ serde_json = "1.0.150"
 # recompile and debuggable.
 [profile.dev.package."*"]
 opt-level = 3
+
+# The shipped build: small and fast. `strip` drops debug symbols; `lto` and a
+# single codegen unit trade compile time for a leaner, quicker binary.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
