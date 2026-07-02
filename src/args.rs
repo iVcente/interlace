@@ -8,6 +8,27 @@
 
 use crate::model::{Encode, Kind, Project};
 use std::collections::HashMap;
+use std::path::Path;
+
+/// Whether the output container accepts per-stream metadata and disposition.
+/// Raw/elementary muxers (`.aac`, `.ac3`, `.srt`, a raw `.h264` bitstream, …)
+/// reject `-metadata:s`/`-disposition` — extraction targets one of these — so we
+/// emit only `-map` + `-c copy` for them. Real containers (mkv/mp4/mov/webm, and
+/// the mka/mks single-stream fallbacks) take the tags.
+fn output_takes_stream_tags(output: &Path) -> bool {
+    let ext = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    !matches!(
+        ext.as_deref(),
+        Some(
+            "aac" | "ac3" | "eac3" | "dts" | "mp3" | "flac" | "opus" | "ogg" | "wav" | "thd"
+                | "h264" | "264" | "h265" | "hevc" | "265" | "av1" | "obu" | "srt" | "ass"
+                | "ssa" | "vtt" | "sup" | "sub"
+        )
+    )
+}
 
 impl Project {
     /// Render this project as the argument vector for `ffmpeg` (the program name
@@ -31,6 +52,9 @@ impl Project {
             a.push("-map".into());
             a.push(format!("{}:{}", s.source.input, s.source.index));
         }
+
+        // Raw/elementary outputs (extraction) reject per-stream tags entirely.
+        let emit_tags = output_takes_stream_tags(&self.output);
 
         // Per-type output counter: the Nth audio we mapped is `:a:<n>`.
         let mut counter: HashMap<char, usize> = HashMap::new();
@@ -65,8 +89,8 @@ impl Project {
 
             // Attachments (embedded fonts) and data streams are copied through,
             // but ffmpeg warns/errors on `-metadata`/`-disposition` for those
-            // types — so stop here for them.
-            if matches!(s.source.kind, Kind::Attachment | Kind::Data) {
+            // types — as do raw/elementary output muxers — so stop here for them.
+            if matches!(s.source.kind, Kind::Attachment | Kind::Data) || !emit_tags {
                 *counter.get_mut(&c).unwrap() += 1;
                 continue;
             }
@@ -266,5 +290,22 @@ mod tests {
             joined.contains("-disposition:a:1 default+forced"),
             "flags ride along to a:1: {joined}"
         );
+    }
+
+    /// A raw/elementary output (extraction target) emits only `-map` + `-c copy`:
+    /// no `-metadata`/`-disposition`, which those muxers reject.
+    #[test]
+    fn raw_output_skips_metadata_and_disposition() {
+        let audio = keep(src(0, 1, Kind::Audio, "ac3"), lang("eng"));
+        let mut p = project(&["in.mkv"], vec![audio]);
+        p.output = PathBuf::from("in.eng.ac3");
+
+        let args = p.to_args();
+        let joined = args.join(" ");
+
+        assert_eq!(values_after(&args, "-map"), ["0:1"]);
+        assert!(joined.contains("-c:a:0 copy"), "{joined}");
+        assert!(!joined.contains("-disposition"), "no disposition: {joined}");
+        assert!(!joined.contains("-metadata"), "no metadata: {joined}");
     }
 }

@@ -19,6 +19,7 @@ const CHANNELS: [(Option<u32>, &str); 4] = [
 ];
 
 pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
+    let mut extract_clicked = false;
     card(ui, |ui| {
         let Some(idx) = app.selected else {
             section_label(ui, "INSPECTOR");
@@ -79,7 +80,40 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
             ui.checkbox(&mut stream.meta.default, "default");
             ui.checkbox(&mut stream.meta.forced, "forced");
         });
+
+        // Extract just this stream to its own file. `stream`'s mutable borrow has
+        // ended above, so we can reborrow `project` to preview the target name.
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let can_extract = !matches!(kind, Kind::Attachment | Kind::Data);
+            if ui
+                .add_enabled(can_extract, egui::Button::new("Extract to file…"))
+                .on_hover_text("Copy just this stream out to its own file")
+                .clicked()
+            {
+                extract_clicked = true;
+            }
+            match project.extract(idx) {
+                Some(x) => {
+                    let name = x
+                        .output
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    ui.weak(format!("→ {name}"));
+                }
+                None => {
+                    ui.weak("attachments/data can't be extracted here");
+                }
+            }
+        });
     });
+
+    if extract_clicked {
+        app.extract_selected();
+    }
 }
 
 /// A captioned field: small label above its widget, matching the mockup.

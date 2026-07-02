@@ -151,6 +151,28 @@ fn spawn(ffmpeg: &str, args: Vec<String>, duration: Option<f64>) -> Result<Recei
     Ok(rx)
 }
 
+/// Probe a binary by running `<program> -version`, returning its first line
+/// (e.g. `ffmpeg version 8.1 …`) on success or a legible error if it can't be
+/// launched or exits non-zero. Used at startup to detect ffmpeg/ffprobe and to
+/// validate a user-supplied override path.
+pub fn version(program: &str) -> Result<String, String> {
+    let mut cmd = Command::new(program);
+    cmd.arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    no_window(&mut cmd);
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("not found (`{program}`): {e}"))?;
+    if !output.status.success() {
+        return Err(format!("`{program} -version` exited with an error"));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().next().unwrap_or("").trim().to_string())
+}
+
 /// Split a command line into argv tokens, honoring `'…'` and `"…"` quoting so a
 /// path with spaces survives as one token. Backslashes are kept literal (Windows
 /// paths are the common case), so there's no escape processing. An empty quoted

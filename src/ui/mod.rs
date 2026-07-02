@@ -42,19 +42,28 @@ pub struct InterlaceApp {
     /// Last error to surface (probe failure, etc.).
     pub(crate) error: Option<String>,
     pub(crate) run_state: RunState,
-    /// Set when Run is pressed but the output already exists — drives a modal.
-    pub(crate) pending_overwrite: bool,
+    /// A run awaiting overwrite confirmation. Holds the exact project to run
+    /// (the main remux, or a one-off extract) so the modal can start it as-is.
+    pub(crate) pending_run: Option<Project>,
     /// The command-bar escape hatch. `None` means "follow the model" (the bar
     /// mirrors `to_args()` live); `Some` means the user has edited it, so Run
     /// executes this text verbatim instead. Reset to `None` on load or "Reset".
     pub(crate) command_edit: Option<String>,
     pub(crate) ffprobe: String,
     pub(crate) ffmpeg: String,
+    /// Cached results of the last `<bin> -version` probe (`Ok(version-line)` or a
+    /// legible error). `Ok("")` means "not yet checked" (the test default).
+    pub(crate) ffmpeg_status: Result<String, String>,
+    pub(crate) ffprobe_status: Result<String, String>,
+    /// Whether the binaries settings panel is expanded.
+    pub(crate) show_settings: bool,
 }
 
 impl InterlaceApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self::empty()
+        let mut app = Self::empty();
+        app.recheck_binaries(); // detect ffmpeg/ffprobe up front
+        app
     }
 
     fn empty() -> Self {
@@ -63,11 +72,26 @@ impl InterlaceApp {
             selected: None,
             error: None,
             run_state: RunState::Idle,
-            pending_overwrite: false,
+            pending_run: None,
             command_edit: None,
             ffprobe: "ffprobe".into(),
             ffmpeg: "ffmpeg".into(),
+            ffmpeg_status: Ok(String::new()),
+            ffprobe_status: Ok(String::new()),
+            show_settings: false,
         }
+    }
+
+    /// Re-probe both binaries and cache their status (called at startup and from
+    /// the settings "Re-check" button after an override path is edited).
+    pub(crate) fn recheck_binaries(&mut self) {
+        self.ffmpeg_status = run::version(&self.ffmpeg);
+        self.ffprobe_status = run::version(&self.ffprobe);
+    }
+
+    /// Both binaries resolved on the last check.
+    pub(crate) fn binaries_ok(&self) -> bool {
+        self.ffmpeg_status.is_ok() && self.ffprobe_status.is_ok()
     }
 
     /// Probe `path` and make it the current project, selecting the first stream.
@@ -139,20 +163,41 @@ impl InterlaceApp {
 
     /// Called when Run is pressed: confirm overwrite if needed, else start.
     pub(crate) fn on_run_clicked(&mut self) {
-        if matches!(self.run_state, RunState::Running { .. }) {
-            return;
-        }
         // Escape hatch: an edited command runs verbatim, bypassing the model
         // (and thus the model-based overwrite pre-check — the user owns `-y`).
         if let Some(command) = self.command_edit.clone() {
-            self.start_run_edited(&command);
+            if !matches!(self.run_state, RunState::Running { .. }) {
+                self.start_run_edited(&command);
+            }
             return;
         }
-        let Some(p) = &self.project else { return };
-        if p.output.exists() {
-            self.pending_overwrite = true;
+        if let Some(p) = self.project.clone() {
+            self.begin_run(p);
+        }
+    }
+
+    /// Extract the selected stream to its own file, running it as a one-off job.
+    pub(crate) fn extract_selected(&mut self) {
+        let Some(idx) = self.selected else { return };
+        let Some(project) = &self.project else { return };
+        match project.extract(idx) {
+            Some(extract) => {
+                self.error = None;
+                self.begin_run(extract);
+            }
+            None => self.error = Some("This stream type can't be extracted.".into()),
+        }
+    }
+
+    /// Start `project`, confirming first if its output already exists.
+    fn begin_run(&mut self, project: Project) {
+        if matches!(self.run_state, RunState::Running { .. }) {
+            return;
+        }
+        if project.output.exists() {
+            self.pending_run = Some(project);
         } else {
-            self.start_run(false);
+            self.start_run_project(project, false);
         }
     }
 
@@ -167,8 +212,7 @@ impl InterlaceApp {
         };
     }
 
-    fn start_run(&mut self, overwrite: bool) {
-        let Some(project) = self.project.clone() else { return };
+    fn start_run_project(&mut self, project: Project, overwrite: bool) {
         self.run_state = match run::run(&self.ffmpeg, &project, overwrite) {
             Ok(rx) => RunState::Running {
                 rx,
@@ -225,12 +269,21 @@ impl InterlaceApp {
             header(ui, self);
             ui.add_space(8.0);
 
+            let red = egui::Color32::from_rgb(220, 80, 80);
+            if !self.binaries_ok() {
+                ui.colored_label(red, "⚠ ffmpeg/ffprobe not found — open ⚙ to set the path.");
+                ui.add_space(6.0);
+            }
             if let Some(err) = &self.error {
-                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), format!("⚠ {err}"));
+                ui.colored_label(red, format!("⚠ {err}"));
                 ui.add_space(6.0);
             }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
+                if self.show_settings {
+                    settings_card(ui, self);
+                    ui.add_space(8.0);
+                }
                 sources::show(ui, self);
                 ui.add_space(8.0);
                 table::show(ui, self);
@@ -245,14 +298,8 @@ impl InterlaceApp {
     }
 
     fn overwrite_modal(&mut self, ctx: &egui::Context) {
-        if !self.pending_overwrite {
-            return;
-        }
-        let path = self
-            .project
-            .as_ref()
-            .map(|p| p.output.display().to_string())
-            .unwrap_or_default();
+        let Some(project) = &self.pending_run else { return };
+        let path = project.output.display().to_string();
 
         let (mut start, mut cancel) = (false, false);
         egui::Window::new("⚠ Output file exists")
@@ -273,10 +320,11 @@ impl InterlaceApp {
             });
 
         if start {
-            self.pending_overwrite = false;
-            self.start_run(true);
+            if let Some(project) = self.pending_run.take() {
+                self.start_run_project(project, true);
+            }
         } else if cancel {
-            self.pending_overwrite = false;
+            self.pending_run = None;
         }
     }
 }
@@ -320,10 +368,13 @@ fn failure_line(f: &run::RunFailure) -> String {
 
 // --- header ------------------------------------------------------------------
 
-fn header(ui: &mut egui::Ui, app: &InterlaceApp) {
+fn header(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     ui.horizontal(|ui| {
-        ui.heading("⚙ Stream editor");
+        ui.heading("Stream editor");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("⚙").on_hover_text("Binaries / settings").clicked() {
+                app.show_settings = !app.show_settings;
+            }
             let label = app
                 .project
                 .as_ref()
@@ -332,6 +383,56 @@ fn header(ui: &mut egui::Ui, app: &InterlaceApp) {
             ui.weak(label);
         });
     });
+}
+
+/// The collapsible binaries panel: editable ffmpeg/ffprobe paths, their detected
+/// version (or error), and a button to re-probe after editing.
+fn settings_card(ui: &mut egui::Ui, app: &mut InterlaceApp) {
+    card(ui, |ui| {
+        section_label(ui, "BINARIES");
+        ui.add_space(4.0);
+        ui.weak("A bare name resolves via PATH; enter a full path to override.");
+        ui.add_space(6.0);
+
+        egui::Grid::new("binaries_grid")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("ffmpeg");
+                ui.text_edit_singleline(&mut app.ffmpeg);
+                ui.end_row();
+                ui.label("");
+                status_line(ui, &app.ffmpeg_status);
+                ui.end_row();
+
+                ui.label("ffprobe");
+                ui.text_edit_singleline(&mut app.ffprobe);
+                ui.end_row();
+                ui.label("");
+                status_line(ui, &app.ffprobe_status);
+                ui.end_row();
+            });
+
+        ui.add_space(6.0);
+        if ui.button("Re-check").clicked() {
+            app.recheck_binaries();
+        }
+    });
+}
+
+/// Render a binary's last probe result: green version, red error, or "not checked".
+fn status_line(ui: &mut egui::Ui, status: &Result<String, String>) {
+    match status {
+        Ok(v) if v.is_empty() => {
+            ui.weak("not checked");
+        }
+        Ok(v) => {
+            ui.colored_label(egui::Color32::from_rgb(80, 200, 120), format!("✓ {v}"));
+        }
+        Err(e) => {
+            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), format!("✗ {e}"));
+        }
+    }
 }
 
 // --- shared drawing helpers (used by the submodules) -------------------------
@@ -498,6 +599,32 @@ mod tests {
             app.project.as_ref().unwrap().streams[0].encode,
             Encode::Copy
         ));
+    }
+
+    #[test]
+    fn renders_settings_panel_and_missing_binary_banner() {
+        let mut app = app_with_demo();
+        app.show_settings = true;
+        app.ffmpeg_status = Err("not found (`ffmpeg`)".into());
+        app.ffprobe_status = Ok("ffprobe version 8.1".into());
+        assert!(!app.binaries_ok());
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
+    }
+
+    #[test]
+    fn extract_of_attachment_sets_error() {
+        let mut app = app_with_demo();
+        // Append an attachment and select it; extracting it isn't supported.
+        let attach = OutStream {
+            source: Source { input: 0, index: 9, kind: Kind::Attachment, codec: "ttf".into() },
+            meta: Meta::default(),
+            encode: Encode::Copy,
+        };
+        app.project.as_mut().unwrap().streams.push(attach);
+        app.selected = Some(app.project.as_ref().unwrap().streams.len() - 1);
+        app.extract_selected();
+        assert!(app.error.is_some());
     }
 
     #[test]
