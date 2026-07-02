@@ -35,7 +35,7 @@ fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([780.0, 720.0])
         .with_min_inner_size([560.0, 480.0])
-        .with_title("Interlace");
+        .with_title("interlace");
     // Window/taskbar icon. Embedded at compile time; ignored if it won't decode.
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(icon);
@@ -47,7 +47,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "Interlace",
+        "interlace",
         options,
         Box::new(|cc| {
             let mut app = ui::InterlaceApp::new(cc);
