@@ -12,7 +12,7 @@ use crate::model::{Encode, OutStream};
 const ROW_HEIGHT: f32 = 26.0;
 const COL_HANDLE: f32 = 20.0;
 const COL_TYPE: f32 = 78.0;
-const COL_FLAGS: f32 = 96.0;
+const COL_FLAGS: f32 = 110.0;
 const COL_ACTION: f32 = 116.0;
 
 enum RowAction {
@@ -77,6 +77,9 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
 
 fn header_row(ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
+        // Cells carry their own fixed widths; zero the gap between them so the
+        // widths sum exactly to the row and columns don't drift or wrap.
+        ui.spacing_mut().item_spacing.x = 0.0;
         cell(ui, COL_HANDLE, |_| {});
         cell(ui, COL_TYPE, |ui| head(ui, "TYPE"));
         let stream_w = (ui.available_width() - COL_FLAGS - COL_ACTION).max(80.0);
@@ -107,6 +110,8 @@ fn stream_row(
         .inner_margin(egui::Margin::symmetric(4, 2))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                // Match header_row: fixed-width cells, no inter-cell gap.
+                ui.spacing_mut().item_spacing.x = 0.0;
                 cell(ui, COL_HANDLE, |ui| {
                     // Only the handle starts a drag; payload is the row index.
                     ui.dnd_drag_source(egui::Id::new("stream_dnd").with(i), i, |ui| {
@@ -116,10 +121,16 @@ fn stream_row(
                 cell(ui, COL_TYPE, |ui| badge(ui, s.source.kind));
                 let stream_w = (ui.available_width() - COL_FLAGS - COL_ACTION).max(80.0);
                 cell(ui, stream_w, |ui| {
-                    ui.label(summary(s));
+                    // Truncate to the cell so a long title can't overflow and
+                    // shove the FLAGS/ACTION columns out of alignment; the full
+                    // text stays available on hover.
+                    let text = summary(s);
+                    ui.add(egui::Label::new(text.as_str()).truncate())
+                        .on_hover_text(text);
                 });
                 cell(ui, COL_FLAGS, |ui| {
-                    ui.label(egui::RichText::new(flags(s)).color(egui::Color32::from_gray(170)));
+                    let text = egui::RichText::new(flags(s)).color(egui::Color32::from_gray(170));
+                    ui.add(egui::Label::new(text).truncate());
                 });
                 cell_rtl(ui, COL_ACTION, |ui| {
                     // Rightmost first in a right-to-left layout.
@@ -158,6 +169,12 @@ fn cell_rtl(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
 
 fn lay(ui: &mut egui::Ui, width: f32, layout: egui::Layout, add: impl FnOnce(&mut egui::Ui)) {
     ui.allocate_ui_with_layout(egui::vec2(width, ROW_HEIGHT), layout, |ui| {
+        // Pin the cell to *exactly* `width`. `allocate_ui_with_layout` otherwise
+        // shrinks a cell to its content (and leaves the wrap width unbounded), so
+        // without this columns collapse together and long labels shove later
+        // columns sideways instead of truncating.
+        ui.set_min_width(width);
+        ui.set_max_width(width);
         ui.set_min_height(ROW_HEIGHT);
         add(ui);
     });
