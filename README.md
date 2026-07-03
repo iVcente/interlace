@@ -2,7 +2,7 @@
 
 A focused native desktop app for **remuxing** media -- reordering, tagging,
 removing, extracting, inserting, and converting the streams inside a video file --
-built as a friendly GUI over `ffmpeg` / `ffprobe`.
+built as a friendly GUI over `ffmpeg`/`ffprobe`.
 
 Five of its six operations are lossless container edits (`-c copy`): they rewrap
 your streams in seconds without re-encoding. Only audio conversion re-encodes.
@@ -31,7 +31,7 @@ with a suggestion.
 
 Interlace calls `ffmpeg` and `ffprobe` -- it does **not** bundle them.
 
-- Install a recent ffmpeg build and put `ffmpeg` / `ffprobe` on your `PATH`, or
+- Install a recent ffmpeg build and put `ffmpeg`/`ffprobe` on your `PATH`, or
 - Open the **⚙** panel in the app and point it at your binaries directly.
 
 The **⚙** panel shows the detected version (or a clear error) for each.
