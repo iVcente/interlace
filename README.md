@@ -12,11 +12,13 @@ your streams in seconds without re-encoding. Only audio conversion re-encodes.
 ## What it does
 
 - **Reorder** streams by dragging rows into the output order you want.
-- **Tag** language, title, and `default` / `forced` flags per stream.
+- **Tag** language, title, and `default` / `forced` flags per stream — plus a
+  title for the whole output file.
 - **Remove** streams you don't want.
 - **Extract** a single stream to its own file (`.aac`, `.srt`, …), picking the
   right container automatically.
-- **Insert** streams from additional files (add another input).
+- **Insert** an external audio or subtitle track from another file, with a
+  per-track sync offset to line it up against the video.
 - **Convert** audio to AAC / AC-3 / Opus / FLAC / MP3 with bitrate and channel
   control.
 

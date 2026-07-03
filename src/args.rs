@@ -45,7 +45,7 @@ impl Project {
         // integer milliseconds so tiny float noise never emits a spurious offset,
         // and format with a fixed `.` decimal (locale-independent, no `1e-1` forms).
         for input in &self.inputs {
-            let ms = (input.offset_secs * 1000.0).round() as i64;
+            let ms = input.offset_ms();
             if ms != 0 {
                 a.push("-itsoffset".into());
                 a.push(format!("{:.3}", ms as f64 / 1000.0)); // e.g. "0.200", "-0.150"
@@ -75,11 +75,15 @@ impl Project {
             a.push(format!("title={title}"));
         }
 
-        // Per-type output counter: the Nth audio we mapped is `:a:<n>`.
+        // Per-type output counter: the Nth audio we mapped is `:a:<n>`. Claim this
+        // stream's index and bump the counter up front, so the two early-outs below
+        // (attachment/data, raw output) can't forget to advance it.
         let mut counter: HashMap<char, usize> = HashMap::new();
         for s in &live {
             let c = s.source.kind.spec();
-            let n = *counter.entry(c).or_insert(0);
+            let slot = counter.entry(c).or_insert(0);
+            let n = *slot;
+            *slot += 1;
             let spec = format!("{c}:{n}"); // e.g. "a:0"
 
             // Codec: copy for everything except the audio-conversion path.
@@ -112,7 +116,6 @@ impl Project {
             // but ffmpeg warns/errors on `-metadata`/`-disposition` for those
             // types — as do raw/elementary output muxers — so stop here for them.
             if matches!(s.source.kind, Kind::Attachment | Kind::Data) || !emit_tags {
-                *counter.get_mut(&c).unwrap() += 1;
                 continue;
             }
 
@@ -142,8 +145,6 @@ impl Project {
             } else {
                 flags.join("+")
             });
-
-            *counter.get_mut(&c).unwrap() += 1;
         }
 
         a.push(self.output.display().to_string());

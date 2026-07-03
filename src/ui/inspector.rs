@@ -232,11 +232,7 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
                 }
                 match project.extract(idx) {
                     Some(x) => {
-                        let name = x
-                            .output
-                            .file_name()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_default();
+                        let name = super::file_name_lossy(&x.output).unwrap_or_default();
                         // Truncate to the space left by the button: a long output
                         // name must not widen the inspector panel past the window
                         // (the panel grows to fit its content, then overflows). A

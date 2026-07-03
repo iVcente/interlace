@@ -298,8 +298,8 @@ fn changes(s: &OutStream, input: &Input) -> Vec<Change> {
             ),
         });
     }
-    // A sync offset on the source input (gated on integer ms, like `to_args`).
-    if (input.offset_secs * 1000.0).round() as i64 != 0 {
+    // A meaningful sync offset on the source input (same ≥1ms gate as `to_args`).
+    if input.has_offset() {
         out.push(Change {
             label: "offset",
             color: C_OFFSET,
@@ -357,13 +357,10 @@ fn summary(s: &OutStream, input: &Input) -> String {
     // Embedded tracks come from a non-primary input: name the file it came from,
     // and its sync offset if one is set.
     if s.source.input != 0 {
-        let name = input
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
+        let name = super::file_name_lossy(&input.path)
             .unwrap_or_else(|| format!("input {}", s.source.input));
         parts.push(format!("from {name}"));
-        if (input.offset_secs * 1000.0).round() as i64 != 0 {
+        if input.has_offset() {
             parts.push(format!("{:+}s", trim_offset(input.offset_secs)));
         }
     }

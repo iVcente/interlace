@@ -30,15 +30,6 @@ pub(super) fn show_issues(ui: &mut egui::Ui, app: &mut InterlaceApp) {
 
 /// The editable command bar, rendered into the resizable bottom panel.
 pub(super) fn show_command(ui: &mut egui::Ui, app: &mut InterlaceApp) {
-    command_card(ui, app);
-}
-
-fn command_card(ui: &mut egui::Ui, app: &mut InterlaceApp) {
-    // The model's command line, always computed so we can show or diff against it.
-    let model_text = match &app.project {
-        Some(p) => format!("ffmpeg {}", p.to_args().join(" ")),
-        None => String::new(),
-    };
     let edited = app.command_edit.is_some();
 
     card(ui, |ui| {
@@ -59,8 +50,17 @@ fn command_card(ui: &mut egui::Ui, app: &mut InterlaceApp) {
         });
         ui.add_space(4.0);
 
-        // Show the edited buffer if present, otherwise the live model command.
-        let mut text = app.command_edit.clone().unwrap_or_else(|| model_text.clone());
+        // The edited buffer if the user has taken the escape hatch, otherwise the
+        // live model command — recomputed each frame so it tracks edits made
+        // elsewhere. When edited we don't build the model command at all: it isn't
+        // shown, and `to_args()` allocates the whole arg vector every frame.
+        let mut text = match &app.command_edit {
+            Some(edited) => edited.clone(),
+            None => match &app.project {
+                Some(p) => format!("ffmpeg {}", p.to_args().join(" ")),
+                None => String::new(),
+            },
+        };
         let response = ui.add(
             egui::TextEdit::multiline(&mut text)
                 .font(egui::TextStyle::Monospace)

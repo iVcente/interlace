@@ -69,6 +69,19 @@ impl Input {
             offset_secs: 0.0,
         }
     }
+
+    /// The timestamp shift in whole milliseconds — the resolution ffmpeg is
+    /// actually given (`to_args` formats the offset to 3 decimals). Sub-millisecond
+    /// float noise rounds to 0, so this is the honest unit for "is there an offset".
+    pub fn offset_ms(&self) -> i64 {
+        (self.offset_secs * 1000.0).round() as i64
+    }
+
+    /// Whether this input carries a meaningful (≥ 1 ms) sync offset. The single
+    /// predicate the serializer and the table's badge/summary all share.
+    pub fn has_offset(&self) -> bool {
+        self.offset_ms() != 0
+    }
 }
 
 /// Where an output stream's packets come from.
@@ -79,8 +92,8 @@ pub struct Source {
     /// Absolute stream index within that input, as reported by ffprobe.
     pub index: usize,
     pub kind: Kind,
-    /// Display only, e.g. "flac". Surfaced in the stream table (M3).
-    #[allow(dead_code)]
+    /// Display only, e.g. "flac". Surfaced in the stream table, and used to pick a
+    /// natural file extension when extracting a stream (see `extract.rs`).
     pub codec: String,
     /// The source stream's measured bitrate in kbps, if ffprobe reported one.
     /// Used by `Bitrate::Auto` to follow the source; `None` when unknown.
@@ -229,10 +242,9 @@ pub struct Project {
     /// sets `-metadata title=…`. Distinct from per-stream `Meta::title`.
     pub title: Option<String>,
     pub output: PathBuf,
-    /// Duration of the primary input in seconds, from ffprobe `-show_format`.
-    /// Kept here so the run layer can compute a progress percentage later (M2).
+    /// Duration of the primary input in seconds, from ffprobe `-show_format`. The
+    /// run layer uses it to turn ffmpeg's `out_time` into a progress fraction.
     /// `None` if ffprobe didn't report one.
-    #[allow(dead_code)]
     pub duration_secs: Option<f64>,
 }
 

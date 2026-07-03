@@ -16,7 +16,7 @@ mod table;
 
 use crate::model::{Encode, Kind, OutStream, Project};
 use crate::run::{self, RunUpdate};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 /// The state of the current (or last) ffmpeg run.
@@ -238,21 +238,11 @@ impl InterlaceApp {
     pub(crate) fn start_run_edited(&mut self, command: &str) {
         let args = command_args(command);
         let duration = self.project.as_ref().and_then(|p| p.duration_secs);
-        self.run_state = match run::run_raw(&self.ffmpeg, args, duration) {
-            Ok(rx) => RunState::Running { rx, fraction: 0.0, line: "starting…".into() },
-            Err(e) => RunState::Done { ok: false, line: e },
-        };
+        self.run_state = run_state_from(run::run_raw(&self.ffmpeg, args, duration));
     }
 
     fn start_run_project(&mut self, project: Project, overwrite: bool) {
-        self.run_state = match run::run(&self.ffmpeg, &project, overwrite) {
-            Ok(rx) => RunState::Running {
-                rx,
-                fraction: 0.0,
-                line: "starting…".into(),
-            },
-            Err(e) => RunState::Done { ok: false, line: e },
-        };
+        self.run_state = run_state_from(run::run(&self.ffmpeg, &project, overwrite));
     }
 
     /// Drain progress updates each frame while a run is active.
@@ -434,6 +424,20 @@ fn command_args(command: &str) -> Vec<String> {
     args
 }
 
+/// Turn a spawn result into the initial `RunState`: a live `Running` on success,
+/// or a `Done` carrying the launch error. Shared by the model-driven and
+/// escape-hatch run paths so their starting state can't drift apart.
+fn run_state_from(result: Result<Receiver<RunUpdate>, String>) -> RunState {
+    match result {
+        Ok(rx) => RunState::Running {
+            rx,
+            fraction: 0.0,
+            line: "starting…".into(),
+        },
+        Err(e) => RunState::Done { ok: false, line: e },
+    }
+}
+
 fn progress_line(p: &run::Progress) -> String {
     p.fraction
         .map(|f| format!("{:.0}%", f * 100.0))
@@ -498,6 +502,13 @@ fn status_line(ui: &mut egui::Ui, status: &Result<String, String>) {
 }
 
 // --- shared drawing helpers (used by the submodules) -------------------------
+
+/// A path's final component as an owned, lossy `String`, or `None` when the path
+/// has no file name (ends in `..`, or is empty). Callers supply their own fallback
+/// for the `None` case — a full-path display, a synthetic `input N` label, etc.
+pub(super) fn file_name_lossy(path: &Path) -> Option<String> {
+    path.file_name().map(|n| n.to_string_lossy().into_owned())
+}
 
 /// A rounded "card" panel wrapping a section, matching the mockup's grouping.
 pub(super) fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {

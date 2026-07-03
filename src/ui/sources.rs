@@ -52,10 +52,7 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     if let Some(project) = &app.project {
                         for input in &project.inputs {
-                            let name = input
-                                .path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
+                            let name = super::file_name_lossy(&input.path)
                                 .unwrap_or_else(|| input.path.display().to_string());
                             chip(ui, &name);
                         }
