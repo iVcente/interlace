@@ -2,8 +2,9 @@
 #
 #   scripts\package.ps1
 #
-# Produces dist\interlace-<version>-win-x64.zip containing the exe, the README,
-# and the icon. Run from anywhere; paths are resolved relative to the repo root.
+# Produces dist\interlace-<version>-win-x64.zip containing the exe and the
+# README. The app icon is embedded in the exe, so no loose icon is shipped.
+# Run from anywhere; paths are resolved relative to the repo root.
 
 $ErrorActionPreference = 'Stop'
 
@@ -40,7 +41,6 @@ if (Test-Path $stage)
 New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item $exe $stage
 Copy-Item "$root\README.md" $stage
-Copy-Item "$root\assets\icon.png" "$stage\icon.png"
 
 # Zip it
 $zip = "$stage.zip"
