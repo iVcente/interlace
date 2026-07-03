@@ -237,10 +237,23 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
                             .file_name()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        ui.weak(format!("» {name}"));
+                        // Truncate to the space left by the button: a long output
+                        // name must not widen the inspector panel past the window
+                        // (the panel grows to fit its content, then overflows). A
+                        // truncated Label shows the full text on hover by itself.
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(format!("» {name}")).weak())
+                                .truncate(),
+                        );
                     }
                     None => {
-                        ui.weak("attachments/data can't be extracted here");
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("attachments/data can't be extracted here")
+                                    .weak(),
+                            )
+                            .truncate(),
+                        );
                     }
                 }
             });

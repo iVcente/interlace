@@ -184,6 +184,7 @@ mod tests {
         Project {
             inputs: vec![Input::new(PathBuf::from("in.mkv"))],
             streams,
+            title: None,
             output: PathBuf::from(output),
             duration_secs: None,
         }

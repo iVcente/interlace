@@ -68,6 +68,13 @@ impl Project {
         // Raw/elementary outputs (extraction) reject per-stream tags entirely.
         let emit_tags = output_takes_stream_tags(&self.output);
 
+        // Container-level title, for real containers only. Emitted once, up front,
+        // and independent of per-stream metadata (that's `-metadata:s`, below).
+        if emit_tags && let Some(title) = &self.title {
+            a.push("-metadata".into());
+            a.push(format!("title={title}"));
+        }
+
         // Per-type output counter: the Nth audio we mapped is `:a:<n>`.
         let mut counter: HashMap<char, usize> = HashMap::new();
         for s in &live {
@@ -176,6 +183,7 @@ mod tests {
         Project {
             inputs: inputs.iter().map(|p| Input::new(PathBuf::from(p))).collect(),
             streams,
+            title: None,
             output: PathBuf::from("out.mkv"),
             duration_secs: None,
         }
@@ -385,6 +393,23 @@ mod tests {
         assert!(joined.contains("-c:a:0 copy"), "{joined}");
         assert!(!joined.contains("-disposition"), "no disposition: {joined}");
         assert!(!joined.contains("-metadata"), "no metadata: {joined}");
+    }
+
+    /// A container title emits a single global `-metadata title=…` (no `:s`), and
+    /// only into a real container — a raw/elementary output drops it like the
+    /// per-stream tags.
+    #[test]
+    fn container_title_emitted_globally_for_real_containers() {
+        let v = keep(src(0, 0, Kind::Video, "h264"), Meta::default());
+        let mut p = project(&["in.mkv"], vec![v]);
+        p.title = Some("My Movie".into());
+
+        let args = p.to_args();
+        assert_eq!(values_after(&args, "-metadata"), ["title=My Movie"]);
+
+        // The same project written to a raw output emits no title at all.
+        p.output = PathBuf::from("in.h264");
+        assert!(values_after(&p.to_args(), "-metadata").is_empty());
     }
 
     /// An embedded input's offset emits `-itsoffset` *immediately before* that

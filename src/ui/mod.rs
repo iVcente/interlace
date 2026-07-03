@@ -86,8 +86,8 @@ impl InterlaceApp {
             ffmpeg_status: Ok(String::new()),
             ffprobe_status: Ok(String::new()),
             show_settings: false,
-            show_command: true,
-            prev_show_command: true,
+            show_command: false,
+            prev_show_command: false,
         }
     }
 
@@ -435,12 +435,9 @@ fn command_args(command: &str) -> Vec<String> {
 }
 
 fn progress_line(p: &run::Progress) -> String {
-    let pct = p
-        .fraction
+    p.fraction
         .map(|f| format!("{:.0}%", f * 100.0))
-        .unwrap_or_else(|| "—".into());
-    let speed = p.speed.map(|s| format!("{s:.1}x")).unwrap_or_default();
-    format!("{pct}   ·   t={:.0}s   ·   {speed}", p.out_time_secs)
+        .unwrap_or_else(|| "—".into())
 }
 
 fn failure_line(f: &run::RunFailure) -> String {
@@ -610,6 +607,7 @@ mod tests {
                     ..Default::default()
                 }),
             ],
+            title: None,
             output: PathBuf::from("movie.remux.mkv"),
             duration_secs: Some(120.0),
         }
@@ -833,6 +831,24 @@ mod tests {
         assert_eq!(reds(&mut app), 0, "hiding the panel must not flash id-clash outlines");
         app.show_command = true;
         assert_eq!(reds(&mut app), 0, "showing the panel must not flash id-clash outlines");
+    }
+
+    /// A very long source-file name must not widen the top row past the window:
+    /// the chip truncates into the space left after the action buttons. We can't
+    /// assert pixel widths cheaply here, but rendering at the true minimum window
+    /// size exercises the constrained-width layout path without panicking.
+    #[test]
+    fn renders_long_input_name_at_min_window() {
+        let mut app = app_with_demo();
+        app.project.as_mut().unwrap().inputs[0].path =
+            PathBuf::from("2013.Scary.Movie.5.1920x1080.BDRip.x264.DTS-HD.MA.mkv");
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(790.0, 720.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| app.render(ui));
     }
 
     #[test]

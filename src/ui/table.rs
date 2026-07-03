@@ -126,8 +126,10 @@ fn stream_row(
                 let stream_w = (ui.available_width() - COL_FLAGS - COL_ACTION).max(80.0);
                 cell(ui, stream_w, |ui| {
                     // Truncate to the cell so a long title can't overflow and
-                    // shove the FLAGS/CHANGES columns out of alignment; the full
-                    // text stays available on hover. Removed rows are struck out.
+                    // shove the FLAGS/CHANGES columns out of alignment. A truncated
+                    // Label surfaces the full text on hover on its own, so we add
+                    // no extra tooltip (that would double it up, and would show even
+                    // when nothing is elided). Removed rows are struck out.
                     let text = summary(s, input);
                     let rich = if s.removed {
                         egui::RichText::new(&text)
@@ -136,7 +138,7 @@ fn stream_row(
                     } else {
                         egui::RichText::new(&text)
                     };
-                    ui.add(egui::Label::new(rich).truncate()).on_hover_text(text);
+                    ui.add(egui::Label::new(rich).truncate());
                 });
                 cell(ui, COL_FLAGS, |ui| {
                     let text = egui::RichText::new(flags(s)).color(egui::Color32::from_gray(170));

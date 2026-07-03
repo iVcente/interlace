@@ -18,17 +18,11 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
 
     card(ui, |ui| {
         ui.horizontal(|ui| {
-            if let Some(project) = &app.project {
-                for input in &project.inputs {
-                    let name = input
-                        .path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| input.path.display().to_string());
-                    chip(ui, &name);
-                }
-            }
-            // Add-file/-track and settings sit together on the right of the row.
+            // Pin the action buttons to the right *first*, so they always keep
+            // their space; the source chips then truncate into whatever width is
+            // left. (Laying the chips out first let a long file name shove the
+            // buttons off the row and push the central column wider than the
+            // window, which in turn stranded the inspector's resize handle.)
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("⚙").on_hover_text("Binaries / settings").clicked() {
                     toggle_settings = true;
@@ -52,8 +46,48 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
                 {
                     embed_requested = true;
                 }
+
+                // The chips fill the space left of the buttons, each truncating
+                // to fit rather than widening the row.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if let Some(project) = &app.project {
+                        for input in &project.inputs {
+                            let name = input
+                                .path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| input.path.display().to_string());
+                            chip(ui, &name);
+                        }
+                    }
+                });
             });
         });
+
+        // The container title (whole-file metadata) sits under the source chips,
+        // once a file is loaded. Empty clears it back to `None`, so an untouched
+        // title round-trips through the copy unchanged.
+        if let Some(project) = app.project.as_mut() {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("title")
+                        .small()
+                        .color(egui::Color32::from_gray(150)),
+                );
+                let mut title = project.title.clone().unwrap_or_default();
+                let resp = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut title)
+                            .hint_text("file title")
+                            .desired_width(f32::INFINITY),
+                    )
+                    .on_hover_text("Sets the output container's title metadata");
+                if resp.changed() {
+                    project.title = (!title.is_empty()).then_some(title);
+                }
+            });
+        }
 
         // The Run button and progress bar live right under the source, so the
         // primary action stays with the file it acts on.
@@ -86,9 +120,15 @@ fn run_row(ui: &mut egui::Ui, app: &mut InterlaceApp) {
             // With an edited command we can run even before a file is loaded.
             let have_command = app.project.is_some() || app.command_edit.is_some();
             let enabled = have_command && !running;
-            let label = if running { "● running…" } else { "▶ run" };
+            // No leading glyph on the running label — the ● (U+25CF) isn't in
+            // egui's default fonts and renders as tofu; an animated spinner beside
+            // the button carries the "in progress" cue instead.
+            let label = if running { "running…" } else { "▶ run" };
             if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
                 run_clicked = true;
+            }
+            if running {
+                ui.add(egui::Spinner::new());
             }
 
             let (fraction, text, color) = progress_view(&app.run_state);
@@ -123,12 +163,16 @@ fn progress_view(state: &RunState) -> (f32, String, Option<egui::Color32>) {
     }
 }
 
-/// A read-only rounded chip showing a source file.
-fn chip(ui: &mut egui::Ui, text: &str) {
+/// A read-only rounded chip showing a source file. The name truncates with an
+/// ellipsis to fit the width left after the action buttons — so it never widens
+/// the row past the window. A truncated `Label` shows the full text on hover on
+/// its own (`show_tooltip_when_elided`), so we add no extra tooltip here — that
+/// would double it up, and would also show when nothing is elided.
+fn chip(ui: &mut egui::Ui, name: &str) {
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::symmetric(8, 4))
         .corner_radius(egui::CornerRadius::same(6))
         .show(ui, |ui| {
-            ui.label(text);
+            ui.add(egui::Label::new(name).truncate());
         });
 }

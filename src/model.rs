@@ -224,6 +224,10 @@ impl OutStream {
 pub struct Project {
     pub inputs: Vec<Input>,
     pub streams: Vec<OutStream>,
+    /// Container-level title tag for the whole output file. `None` emits nothing
+    /// (the source container title, if any, passes through the copy); `Some`
+    /// sets `-metadata title=…`. Distinct from per-stream `Meta::title`.
+    pub title: Option<String>,
     pub output: PathBuf,
     /// Duration of the primary input in seconds, from ffprobe `-show_format`.
     /// Kept here so the run layer can compute a progress percentage later (M2).
@@ -280,6 +284,7 @@ mod tests {
                 .map(|i| Input::new(PathBuf::from(format!("in{i}.mkv"))))
                 .collect(),
             streams,
+            title: None,
             output: PathBuf::from("out.mkv"),
             duration_secs: None,
         }

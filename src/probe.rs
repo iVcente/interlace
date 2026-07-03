@@ -56,6 +56,9 @@ struct RawDisposition {
 struct RawFormat {
     // A string like "1234.567000" in seconds; parsed lazily below.
     duration: Option<String>,
+    // Container-level tags (`title`, ...). We only read `title` today.
+    #[serde(default)]
+    tags: RawTags,
 }
 
 // --- invocation --------------------------------------------------------------
@@ -140,9 +143,14 @@ impl Project {
             .and_then(|f| f.duration.as_deref())
             .and_then(|d| d.parse::<f64>().ok());
 
+        // Seed the container title from the source so an existing title shows in
+        // the editor (and round-trips through the copy) rather than looking unset.
+        let title = probed.format.as_ref().and_then(|f| f.tags.title.clone());
+
         Ok(Project {
             inputs: vec![Input::new(file.to_path_buf())],
             streams,
+            title,
             output: default_output_path(file),
             duration_secs,
         })

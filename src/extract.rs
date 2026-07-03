@@ -43,6 +43,7 @@ impl Project {
         Some(Project {
             inputs: vec![Input::new(input)],
             streams: vec![stream],
+            title: None, // a lone extracted stream carries no container title
             output,
             duration_secs: self.duration_secs,
         })
@@ -120,6 +121,7 @@ mod tests {
         Project {
             inputs: vec![Input::new(PathBuf::from("/media/movie.mkv"))],
             streams,
+            title: None,
             output: PathBuf::from("/media/movie.remux.mkv"),
             duration_secs: Some(90.0),
         }
