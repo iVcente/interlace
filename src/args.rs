@@ -6,7 +6,7 @@
 //! streams in output order and keep a per-type counter; every `-c` / `-metadata`
 //! / `-disposition` uses that output index, not the source index.
 
-use crate::model::{Encode, Kind, Project};
+use crate::model::{Encode, Kind, OutStream, Project};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -46,9 +46,13 @@ impl Project {
             a.push(input.display().to_string());
         }
 
+        // Only streams not marked for removal reach the output; a removed stream
+        // is simply never mapped (and doesn't count toward per-type renumbering).
+        let live: Vec<&OutStream> = self.streams.iter().filter(|s| !s.removed).collect();
+
         // Maps first, in output order. This is what actually fixes ordering:
         // ffmpeg emits streams in the order they're mapped.
-        for s in &self.streams {
+        for s in &live {
             a.push("-map".into());
             a.push(format!("{}:{}", s.source.input, s.source.index));
         }
@@ -58,7 +62,7 @@ impl Project {
 
         // Per-type output counter: the Nth audio we mapped is `:a:<n>`.
         let mut counter: HashMap<char, usize> = HashMap::new();
-        for s in &self.streams {
+        for s in &live {
             let c = s.source.kind.spec();
             let n = *counter.entry(c).or_insert(0);
             let spec = format!("{c}:{n}"); // e.g. "a:0"
@@ -147,11 +151,7 @@ mod tests {
     }
 
     fn keep(source: Source, meta: Meta) -> OutStream {
-        OutStream {
-            source,
-            meta,
-            encode: Encode::Copy,
-        }
+        OutStream::new(source, meta, Encode::Copy)
     }
 
     fn lang(l: &str) -> Meta {
@@ -217,19 +217,37 @@ mod tests {
         assert!(joined.contains("-metadata:s:a:0 language=jpn"), "{joined}");
     }
 
+    /// Soft removal: a stream flagged `removed` is never mapped and doesn't count
+    /// toward per-type renumbering, exactly as if it had been dropped from the vec.
+    #[test]
+    fn removed_stream_excluded_from_output() {
+        let v = keep(src(0, 0, Kind::Video, "h264"), Meta::default());
+        let mut eng = keep(src(0, 1, Kind::Audio, "aac"), lang("eng"));
+        eng.removed = true; // pending removal
+        let jpn = keep(src(0, 2, Kind::Audio, "aac"), lang("jpn"));
+
+        let args = project(&["in.mkv"], vec![v, eng, jpn]).to_args();
+        let joined = args.join(" ");
+
+        assert_eq!(values_after(&args, "-map"), ["0:0", "0:2"]);
+        assert!(!joined.contains("language=eng"), "removed stream absent: {joined}");
+        // jpn is now the only audio → a:0.
+        assert!(joined.contains("-metadata:s:a:0 language=jpn"), "{joined}");
+    }
+
     /// Audio convert: the one re-encode path, on the correct output index.
     #[test]
     fn audio_convert_emits_codec_bitrate_channels() {
         let v = keep(src(0, 0, Kind::Video, "h264"), Meta::default());
-        let audio = OutStream {
-            source: src(0, 1, Kind::Audio, "flac"),
-            meta: Meta::default(),
-            encode: Encode::Audio {
+        let audio = OutStream::new(
+            src(0, 1, Kind::Audio, "flac"),
+            Meta::default(),
+            Encode::Audio {
                 codec: "aac".into(),
                 bitrate_kbps: Some(192),
                 channels: Some(2),
             },
-        };
+        );
 
         let joined = project(&["in.mkv"], vec![v, audio]).to_args().join(" ");
 
@@ -246,14 +264,14 @@ mod tests {
     fn insert_from_second_input() {
         let v = keep(src(0, 0, Kind::Video, "h264"), Meta::default());
         let eng = keep(src(0, 1, Kind::Audio, "aac"), lang("eng"));
-        let commentary = OutStream {
-            source: src(1, 0, Kind::Audio, "flac"),
-            meta: Meta {
+        let commentary = OutStream::new(
+            src(1, 0, Kind::Audio, "flac"),
+            Meta {
                 title: Some("Commentary".into()),
                 ..Default::default()
             },
-            encode: Encode::Copy,
-        };
+            Encode::Copy,
+        );
 
         let args = project(&["vid.mkv", "new.flac"], vec![v, eng, commentary]).to_args();
         let joined = args.join(" ");

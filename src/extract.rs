@@ -26,16 +26,16 @@ impl Project {
 
         // One input, one stream: the source keeps its absolute index (same file)
         // but now refers to input 0 of this fresh project.
-        let stream = OutStream {
-            source: Source {
+        let stream = OutStream::new(
+            Source {
                 input: 0,
                 index: s.source.index,
                 kind: s.source.kind,
                 codec: s.source.codec.clone(),
             },
-            meta: s.meta.clone(),
-            encode: Encode::Copy, // extraction never re-encodes
-        };
+            s.meta.clone(),
+            Encode::Copy, // extraction never re-encodes
+        );
 
         Some(Project {
             inputs: vec![input],
@@ -106,11 +106,11 @@ mod tests {
     use crate::model::Meta;
 
     fn stream(input: usize, index: usize, kind: Kind, codec: &str, lang: Option<&str>) -> OutStream {
-        OutStream {
-            source: Source { input, index, kind, codec: codec.into() },
-            meta: Meta { language: lang.map(Into::into), ..Default::default() },
-            encode: Encode::Copy,
-        }
+        OutStream::new(
+            Source { input, index, kind, codec: codec.into() },
+            Meta { language: lang.map(Into::into), ..Default::default() },
+            Encode::Copy,
+        )
     }
 
     fn project(streams: Vec<OutStream>) -> Project {

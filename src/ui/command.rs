@@ -14,13 +14,11 @@ use crate::validate::{self, Issue, Severity};
 
 pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     // Compatibility findings apply to the model, so hide them once edited.
-    if app.command_edit.is_none() {
-        if let Some(project) = &app.project {
-            let issues = validate::validate(project);
-            if !issues.is_empty() {
-                issues_card(ui, &issues);
-                ui.add_space(8.0);
-            }
+    if app.command_edit.is_none() && let Some(project) = &app.project {
+        let issues = validate::validate(project);
+        if !issues.is_empty() {
+            issues_card(ui, &issues);
+            ui.add_space(8.0);
         }
     }
 

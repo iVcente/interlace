@@ -14,9 +14,9 @@ mod inspector;
 mod sources;
 mod table;
 
-use crate::model::{Encode, Kind, Project};
+use crate::model::{Encode, Kind, OutStream, Project};
 use crate::run::{self, RunUpdate};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 /// The state of the current (or last) ffmpeg run.
@@ -111,7 +111,28 @@ impl InterlaceApp {
 
     // --- model mutations (called by the table/inspector after rendering) -----
 
-    pub(crate) fn remove_stream(&mut self, i: usize) {
+    /// Add a re-encoded sibling of `streams[i]`: the same source, a default AAC
+    /// conversion, inserted right after the original (which stays a stream-copy)
+    /// and selected — so its codec, tags, and order are tuned like any stream.
+    pub(crate) fn add_converted_stream(&mut self, i: usize) {
+        let Some(p) = &mut self.project else { return };
+        let Some(orig) = p.streams.get(i) else { return };
+        // Seed the copy's tags from the original, but clear default/forced so we
+        // don't emit two "default" streams for the same track.
+        let mut meta = orig.meta.clone();
+        meta.default = false;
+        meta.forced = false;
+        let mut converted = OutStream::new(orig.source.clone(), meta, Encode::default_audio());
+        converted.added = true; // synthetic — deleted outright, not soft-removed
+        let at = (i + 1).min(p.streams.len());
+        p.streams.insert(at, converted);
+        self.selected = Some(at);
+    }
+
+    /// Hard-remove `streams[i]` from the project, fixing the selection to a
+    /// surviving stream. Used for synthetic (`added`) streams, which aren't in
+    /// the source file so there's nothing to preview as a "soft" removal.
+    pub(crate) fn delete_stream(&mut self, i: usize) {
         let Some(p) = &mut self.project else { return };
         if i >= p.streams.len() {
             return;
@@ -124,24 +145,6 @@ impl InterlaceApp {
             Some(s) if s == i => Some(i.min(len - 1)),
             other => other, // s < i, or None
         };
-    }
-
-    /// Toggle an audio stream between copy and a default AAC conversion.
-    pub(crate) fn toggle_convert(&mut self, i: usize) {
-        let Some(p) = &mut self.project else { return };
-        let Some(s) = p.streams.get_mut(i) else { return };
-        if s.source.kind != Kind::Audio {
-            return;
-        }
-        s.encode = match s.encode {
-            Encode::Copy => Encode::Audio {
-                codec: "aac".into(),
-                bitrate_kbps: Some(192),
-                channels: None,
-            },
-            Encode::Audio { .. } => Encode::Copy,
-        };
-        self.selected = Some(i);
     }
 
     /// Move the stream at `from` to insertion index `to` (0..=len), keeping the
@@ -265,8 +268,20 @@ impl InterlaceApp {
     fn render(&mut self, ui: &mut egui::Ui) {
         self.poll_run(ui.ctx());
 
+        // The inspector is a right-hand panel. It's added before the central panel
+        // so egui reserves its width first; the table/command flow fills the rest.
+        egui::Panel::right("inspector")
+            .resizable(true)
+            .default_size(320.0)
+            .size_range(260.0..=460.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    inspector::show(ui, self);
+                });
+            });
+
         egui::CentralPanel::default().show(ui, |ui| {
-            header(ui, self);
+            sources::show(ui, self);
             ui.add_space(8.0);
 
             let red = egui::Color32::from_rgb(220, 80, 80);
@@ -284,11 +299,7 @@ impl InterlaceApp {
                     settings_card(ui, self);
                     ui.add_space(8.0);
                 }
-                sources::show(ui, self);
-                ui.add_space(8.0);
                 table::show(ui, self);
-                ui.add_space(8.0);
-                inspector::show(ui, self);
                 ui.add_space(8.0);
                 command::show(ui, self);
             });
@@ -302,18 +313,18 @@ impl InterlaceApp {
         let path = project.output.display().to_string();
 
         let (mut start, mut cancel) = (false, false);
-        egui::Window::new("⚠ Output file exists")
+        egui::Window::new("⚠ output file exists")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(format!("{path}\n\nOverwrite it?"));
+                ui.label(format!("{path}\n\noverwrite it?"));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Overwrite").clicked() {
+                    if ui.button("overwrite").clicked() {
                         start = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button("cancel").clicked() {
                         cancel = true;
                     }
                 });
@@ -366,25 +377,6 @@ fn failure_line(f: &run::RunFailure) -> String {
     format!("failed (exit {code}): {last}")
 }
 
-// --- header ------------------------------------------------------------------
-
-fn header(ui: &mut egui::Ui, app: &mut InterlaceApp) {
-    ui.horizontal(|ui| {
-        ui.heading("Stream editor");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("⚙").on_hover_text("Binaries / settings").clicked() {
-                app.show_settings = !app.show_settings;
-            }
-            let label = app
-                .project
-                .as_ref()
-                .map(|p| format!("output: {}", container_label(&p.output)))
-                .unwrap_or_else(|| "no file loaded".into());
-            ui.weak(label);
-        });
-    });
-}
-
 /// The collapsible binaries panel: editable ffmpeg/ffprobe paths, their detected
 /// version (or error), and a button to re-probe after editing.
 fn settings_card(ui: &mut egui::Ui, app: &mut InterlaceApp) {
@@ -414,7 +406,7 @@ fn settings_card(ui: &mut egui::Ui, app: &mut InterlaceApp) {
             });
 
         ui.add_space(6.0);
-        if ui.button("Re-check").clicked() {
+        if ui.button("re-check").clicked() {
             app.recheck_binaries();
         }
     });
@@ -447,7 +439,6 @@ pub(super) fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
             add(ui);
         });
 }
-
 /// A small uppercase section heading like "SOURCES" / "INSPECTOR".
 pub(super) fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.label(
@@ -493,18 +484,6 @@ pub(super) fn kind_text(kind: Kind) -> &'static str {
     }
 }
 
-/// Human-friendly container name for the output path's extension.
-pub(super) fn container_label(path: &Path) -> String {
-    match path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref() {
-        Some("mkv") => "Matroska (.mkv)".into(),
-        Some("mp4") | Some("m4v") => "MP4 (.mp4)".into(),
-        Some("mov") => "QuickTime (.mov)".into(),
-        Some("webm") => "WebM (.webm)".into(),
-        Some(other) => format!(".{other}"),
-        None => "—".into(),
-    }
-}
-
 /// Open a native file picker for media files. Returns the chosen path, if any.
 pub(super) fn pick_media_file() -> Option<PathBuf> {
     rfd::FileDialog::new()
@@ -518,13 +497,15 @@ pub(super) fn pick_media_file() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Meta, OutStream, Source};
+    use crate::model::{Meta, Source};
 
     fn demo_project() -> Project {
-        let mk = |input, index, kind, codec: &str, meta| OutStream {
-            source: Source { input, index, kind, codec: codec.into() },
-            meta,
-            encode: Encode::Copy,
+        let mk = |input, index, kind, codec: &str, meta| {
+            OutStream::new(
+                Source { input, index, kind, codec: codec.into() },
+                meta,
+                Encode::Copy,
+            )
         };
         Project {
             inputs: vec![PathBuf::from("movie.mkv")],
@@ -569,6 +550,45 @@ mod tests {
     }
 
     #[test]
+    fn add_converted_stream_keeps_original_and_inserts_sibling() {
+        let mut app = app_with_demo(); // selected = 1 (the flac audio, default+jpn)
+        app.add_converted_stream(1);
+        let p = app.project.as_ref().unwrap();
+
+        assert_eq!(p.streams.len(), 4);
+        // Original stays a stream-copy in place.
+        assert!(matches!(p.streams[1].encode, Encode::Copy));
+        assert_eq!(p.streams[1].source.index, 1);
+        // Converted sibling inserted right after: same source, audio re-encode,
+        // tags seeded but default cleared. It becomes the selection.
+        assert!(matches!(p.streams[2].encode, Encode::Audio { .. }));
+        assert_eq!(p.streams[2].source.index, 1);
+        assert_eq!(p.streams[2].meta.language.as_deref(), Some("jpn"));
+        assert!(!p.streams[2].meta.default);
+        assert_eq!(app.selected, Some(2));
+
+        // Both map from the same input stream → the source is emitted twice.
+        let maps: Vec<String> = p
+            .to_args()
+            .windows(2)
+            .filter(|w| w[0] == "-map")
+            .map(|w| w[1].clone())
+            .collect();
+        assert_eq!(maps.iter().filter(|m| *m == "0:1").count(), 2);
+    }
+
+    #[test]
+    fn delete_stream_hard_removes_added_sibling() {
+        let mut app = app_with_demo(); // 3 streams, selected = 1
+        app.add_converted_stream(1); // now 4 streams, added sibling selected at 2
+        assert!(app.project.as_ref().unwrap().streams[2].added);
+        app.delete_stream(2); // hard delete the synthetic stream
+        let p = app.project.as_ref().unwrap();
+        assert_eq!(p.streams.len(), 3); // back to the original three
+        assert!(!p.streams.iter().any(|s| s.added));
+    }
+
+    #[test]
     fn reorder_moves_and_follows_selection() {
         let mut app = app_with_demo();
         // Move the subtitle (idx 2) to the top (insertion index 0).
@@ -579,26 +599,17 @@ mod tests {
     }
 
     #[test]
-    fn remove_fixes_selection() {
-        let mut app = app_with_demo(); // selected = 1
-        app.remove_stream(0); // removing above selection shifts it down
-        assert_eq!(app.selected, Some(0));
-        assert_eq!(app.project.as_ref().unwrap().streams.len(), 2);
-    }
-
-    #[test]
-    fn convert_toggles_audio_only() {
+    fn renders_removed_and_retagged_stream() {
+        // A removed row (dimmed + "remove" badge) and a retagged row exercise the
+        // table's change-summary path and the inspector's removed state together.
         let mut app = app_with_demo();
-        app.toggle_convert(1); // audio → convert
-        assert!(matches!(
-            app.project.as_ref().unwrap().streams[1].encode,
-            Encode::Audio { .. }
-        ));
-        app.toggle_convert(0); // video → no-op
-        assert!(matches!(
-            app.project.as_ref().unwrap().streams[0].encode,
-            Encode::Copy
-        ));
+        {
+            let streams = &mut app.project.as_mut().unwrap().streams;
+            streams[1].removed = true; // pending removal → red badge, struck row
+            streams[2].meta.title = Some("Forced".into()); // retag vs orig_meta
+        }
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
 
     #[test]
@@ -616,11 +627,11 @@ mod tests {
     fn extract_of_attachment_sets_error() {
         let mut app = app_with_demo();
         // Append an attachment and select it; extracting it isn't supported.
-        let attach = OutStream {
-            source: Source { input: 0, index: 9, kind: Kind::Attachment, codec: "ttf".into() },
-            meta: Meta::default(),
-            encode: Encode::Copy,
-        };
+        let attach = OutStream::new(
+            Source { input: 0, index: 9, kind: Kind::Attachment, codec: "ttf".into() },
+            Meta::default(),
+            Encode::Copy,
+        );
         app.project.as_mut().unwrap().streams.push(attach);
         app.selected = Some(app.project.as_ref().unwrap().streams.len() - 1);
         app.extract_selected();
@@ -645,12 +656,5 @@ mod tests {
         app.command_edit = Some("ffmpeg -i in.mkv -c copy out.mkv".into());
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
-    }
-
-    #[test]
-    fn container_label_maps_extensions() {
-        assert_eq!(container_label(Path::new("a.mkv")), "Matroska (.mkv)");
-        assert_eq!(container_label(Path::new("a.mp4")), "MP4 (.mp4)");
-        assert_eq!(container_label(Path::new("a.xyz")), ".xyz");
     }
 }

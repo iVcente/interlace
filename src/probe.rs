@@ -99,21 +99,21 @@ impl Project {
             let Some(kind) = Kind::from_codec_type(&rs.codec_type) else {
                 continue;
             };
-            streams.push(OutStream {
-                source: Source {
+            streams.push(OutStream::new(
+                Source {
                     input: 0,
                     index: rs.index,
                     kind,
                     codec: rs.codec_name.clone(),
                 },
-                meta: Meta {
+                Meta {
                     language: rs.tags.language.clone(),
                     title: rs.tags.title.clone(),
                     default: rs.disposition.default != 0,
                     forced: rs.disposition.forced != 0,
                 },
-                encode: Encode::Copy,
-            });
+                Encode::Copy,
+            ));
         }
 
         let duration_secs = probed

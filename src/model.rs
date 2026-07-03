@@ -65,14 +65,25 @@ pub struct Source {
 #[derive(Debug, Clone)]
 pub enum Encode {
     Copy,
-    /// The audio-conversion (re-encode) path. Constructed by the convert action
-    /// in the UI (M4); until then it's exercised only by tests.
-    #[allow(dead_code)]
+    /// The audio-conversion (re-encode) path, set by the inspector's conversion
+    /// controls.
     Audio {
         codec: String,
         bitrate_kbps: Option<u32>,
         channels: Option<u32>,
     },
+}
+
+impl Encode {
+    /// The starting point when the user converts a stream: 192 kbps AAC, keeping
+    /// the source channel layout. Codec/bitrate/channels are then tunable.
+    pub fn default_audio() -> Self {
+        Encode::Audio {
+            codec: "aac".into(),
+            bitrate_kbps: Some(192),
+            channels: None,
+        }
+    }
 }
 
 /// User-editable tags and flags for a stream.
@@ -81,7 +92,7 @@ pub enum Encode {
 /// original tag pass through the copy unchanged. (Actively *clearing* an
 /// existing tag needs a different representation; that's an editing-milestone
 /// concern, noted in the plan.)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Meta {
     /// ISO 639-2, e.g. "jpn".
     pub language: Option<String>,
@@ -96,6 +107,50 @@ pub struct OutStream {
     pub source: Source,
     pub meta: Meta,
     pub encode: Encode,
+    /// Pending-removal flag. A removed stream stays in the table (dimmed, badged
+    /// "remove") so the change is visible and reversible, but `to_args()` skips
+    /// it — see `Project::to_args`.
+    pub removed: bool,
+    /// The metadata as first probed, kept as the baseline the inspector edits are
+    /// diffed against for the table's change badges. Original `encode` is always
+    /// `Copy` at load, so "converted" is derived from `encode` and not snapshotted.
+    pub orig_meta: Meta,
+    /// Whether this stream was synthesized in the editor (e.g. a converted copy
+    /// added alongside its source) rather than probed from the file. Added
+    /// streams aren't part of the original, so the UI deletes them outright
+    /// instead of offering soft-removal / revert / extract.
+    pub added: bool,
+}
+
+impl OutStream {
+    /// Build a stream, snapshotting `meta` as the change-diff baseline and
+    /// starting un-removed. The single place `orig_meta`/`removed`/`added` are
+    /// seeded; callers that synthesize a stream set `added` afterward.
+    pub fn new(source: Source, meta: Meta, encode: Encode) -> Self {
+        Self {
+            source,
+            orig_meta: meta.clone(),
+            meta,
+            encode,
+            removed: false,
+            added: false,
+        }
+    }
+
+    /// Language or title edited away from the probed original.
+    pub fn tags_changed(&self) -> bool {
+        self.meta.language != self.orig_meta.language || self.meta.title != self.orig_meta.title
+    }
+
+    /// Default/forced disposition edited away from the probed original.
+    pub fn flags_changed(&self) -> bool {
+        self.meta.default != self.orig_meta.default || self.meta.forced != self.orig_meta.forced
+    }
+
+    /// This stream re-encodes rather than stream-copies (audio-convert path).
+    pub fn converted(&self) -> bool {
+        !matches!(self.encode, Encode::Copy)
+    }
 }
 
 /// The whole editing session: the inputs, the ordered output streams, and where

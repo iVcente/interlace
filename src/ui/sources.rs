@@ -1,38 +1,45 @@
-//! The sources bar: one chip per loaded input file, plus an "add file" button.
+//! The top bar: one chip per loaded input file, plus the "add file" and
+//! settings buttons on the right.
 //!
-//! M3 loads a single primary file; the chip's index prefix matches the ffmpeg
-//! `-i` index. Appending *additional* inputs (true stream insertion) is M4, so
-//! for now "add file" opens a picker and loads it as the primary project.
+//! M3 loads a single primary file, shown as a chip. Appending *additional*
+//! inputs (true stream insertion) is M4, so for now "add file" opens a picker
+//! and loads it as the primary project.
 
-use super::{InterlaceApp, card, pick_media_file, section_label};
+use super::{InterlaceApp, card, pick_media_file};
 
 pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     let mut open_requested = false;
+    let mut toggle_settings = false;
 
     card(ui, |ui| {
-        section_label(ui, "SOURCES");
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             if let Some(project) = &app.project {
-                for (i, path) in project.inputs.iter().enumerate() {
+                for path in &project.inputs {
                     let name = path
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.display().to_string());
-                    chip(ui, &format!("{i} · {name}"));
+                    chip(ui, &name);
                 }
             }
-            if ui.button("+ add file").clicked() {
-                open_requested = true;
-            }
+            // Add-file and settings sit together on the right of the same row.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("⚙").on_hover_text("Binaries / settings").clicked() {
+                    toggle_settings = true;
+                }
+                if ui.button("+ add file").clicked() {
+                    open_requested = true;
+                }
+            });
         });
     });
 
+    if toggle_settings {
+        app.show_settings = !app.show_settings;
+    }
     // Run the (blocking) native dialog after the borrow of `app` ends.
-    if open_requested {
-        if let Some(path) = pick_media_file() {
-            app.load_file(path);
-        }
+    if open_requested && let Some(path) = pick_media_file() {
+        app.load_file(path);
     }
 }
 

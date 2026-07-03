@@ -173,11 +173,11 @@ mod tests {
     use std::path::PathBuf;
 
     fn stream(kind: Kind, codec: &str, encode: Encode) -> OutStream {
-        OutStream {
-            source: Source { input: 0, index: 0, kind, codec: codec.into() },
-            meta: Meta::default(),
+        OutStream::new(
+            Source { input: 0, index: 0, kind, codec: codec.into() },
+            Meta::default(),
             encode,
-        }
+        )
     }
 
     fn project(output: &str, streams: Vec<OutStream>) -> Project {
