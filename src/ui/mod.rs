@@ -57,6 +57,13 @@ pub struct InterlaceApp {
     pub(crate) ffprobe_status: Result<String, String>,
     /// Whether the binaries settings panel is expanded.
     pub(crate) show_settings: bool,
+    /// Whether the command bar (a resizable bottom panel) is shown.
+    pub(crate) show_command: bool,
+    /// `show_command` as of the last rendered frame. Adding/removing a panel
+    /// doesn't trigger egui's settle-pass the way changing central content does,
+    /// so on the frame this differs we force a discard to avoid a one-frame
+    /// flash of id-clash outlines while the layout re-settles.
+    prev_show_command: bool,
 }
 
 impl InterlaceApp {
@@ -79,6 +86,8 @@ impl InterlaceApp {
             ffmpeg_status: Ok(String::new()),
             ffprobe_status: Ok(String::new()),
             show_settings: false,
+            show_command: true,
+            prev_show_command: true,
         }
     }
 
@@ -268,10 +277,22 @@ impl InterlaceApp {
     fn render(&mut self, ui: &mut egui::Ui) {
         self.poll_run(ui.ctx());
 
+        // Toggling a panel on/off doesn't trigger egui's automatic settle-pass
+        // (unlike changing central content), so the first frame after a toggle is
+        // laid out unsettled and paints a flash of red id-clash outlines. Force a
+        // discard on that frame so egui re-runs the pass cleanly, as it would for
+        // any other layout change. `prev_show_command` updates now (state survives
+        // the discard) so the re-run pass sees no change and paints normally.
+        if self.show_command != self.prev_show_command {
+            self.prev_show_command = self.show_command;
+            ui.ctx().request_discard("command panel toggled");
+        }
+
         // The inspector is a right-hand panel. It's added before the central panel
         // so egui reserves its width first; the table/command flow fills the rest.
         egui::Panel::right("inspector")
             .resizable(true)
+            .show_separator_line(false) // keep the drag, drop the visible line
             .default_size(320.0)
             .size_range(260.0..=460.0)
             .show(ui, |ui| {
@@ -279,6 +300,22 @@ impl InterlaceApp {
                     inspector::show(ui, self);
                 });
             });
+
+        // The command bar is a resizable bottom panel, like the inspector on the
+        // right. Added after the inspector so it spans only the central column's
+        // width; toggled by the ⌨ button in the sources bar.
+        if self.show_command {
+            egui::Panel::bottom("command")
+                .resizable(true)
+                .show_separator_line(false) // keep the drag, drop the visible line
+                .default_size(150.0)
+                .size_range(90.0..=420.0)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        command::show_command(ui, self);
+                    });
+                });
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             sources::show(ui, self);
@@ -301,7 +338,7 @@ impl InterlaceApp {
                 }
                 table::show(ui, self);
                 ui.add_space(8.0);
-                command::show(ui, self);
+                command::show_issues(ui, self);
             });
         });
 
@@ -318,9 +355,25 @@ impl InterlaceApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(format!("{path}\n\noverwrite it?"));
+                ui.vertical_centered(|ui| {
+                    ui.label(format!("{path}\n\noverwrite it?"));
+                });
                 ui.add_space(8.0);
+                // `vertical_centered` won't center a nested horizontal (it fills
+                // the width), so pad the button row by half its slack ourselves.
                 ui.horizontal(|ui| {
+                    let font = egui::TextStyle::Button.resolve(ui.style());
+                    let pad = ui.spacing().button_padding.x * 2.0;
+                    let gap = ui.spacing().item_spacing.x;
+                    let width = |ui: &egui::Ui, s: &str| {
+                        ui.painter()
+                            .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                            .rect
+                            .width()
+                            + pad
+                    };
+                    let total = width(ui, "overwrite") + width(ui, "cancel") + gap;
+                    ui.add_space(((ui.available_width() - total) * 0.5).max(0.0));
                     if ui.button("overwrite").clicked() {
                         start = true;
                     }
@@ -654,6 +707,52 @@ mod tests {
     fn renders_edited_command_bar_without_panicking() {
         let mut app = app_with_demo();
         app.command_edit = Some("ffmpeg -i in.mkv -c copy out.mkv".into());
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
+    }
+
+    /// Toggling the command panel must not leave egui painting a frame of red
+    /// id-clash outlines: the transition frame should force a clean settle-pass
+    /// (a discard) exactly like changing central content does.
+    #[test]
+    fn toggling_command_panel_discards_the_unsettled_frame() {
+        let mut app = app_with_demo();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(780.0, 720.0));
+        let input = || egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        // Count shapes drawn in egui's pure-red error color — the id-clash outlines.
+        let red = egui::Color32::from_rgb(255, 0, 0);
+        fn count_red(shape: &egui::epaint::Shape, red: egui::Color32) -> usize {
+            use egui::epaint::Shape;
+            match shape {
+                Shape::Rect(r) if r.stroke.color == red || r.fill == red => 1,
+                Shape::LineSegment { stroke, .. } if stroke.color == red => 1,
+                Shape::Circle(c) if c.stroke.color == red || c.fill == red => 1,
+                Shape::Vec(v) => v.iter().map(|s| count_red(s, red)).sum(),
+                _ => 0,
+            }
+        }
+        let mut reds = |app: &mut InterlaceApp| {
+            let out = ctx.run_ui(input(), |ui| app.render(ui));
+            out.shapes.iter().map(|s| count_red(&s.shape, red)).sum::<usize>()
+        };
+
+        assert_eq!(reds(&mut app), 0); // steady state is clean
+        app.show_command = false;
+        assert_eq!(reds(&mut app), 0, "hiding the panel must not flash id-clash outlines");
+        app.show_command = true;
+        assert_eq!(reds(&mut app), 0, "showing the panel must not flash id-clash outlines");
+    }
+
+    #[test]
+    fn renders_with_command_panel_hidden() {
+        // Toggling the command panel off drops the bottom panel entirely; the
+        // rest of the layout must still render (and compatibility findings stay).
+        let mut app = app_with_demo();
+        app.show_command = false;
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }

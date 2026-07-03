@@ -1,4 +1,8 @@
-//! The compatibility findings, the command bar, and the run/progress footer.
+//! The compatibility findings and the editable command bar. The findings stay in
+//! the central column (`show_issues`), while the command bar (`show_command`)
+//! lives in a resizable bottom panel toggled by the ⌨ button in the sources bar.
+//! (The Run button and progress bar live in the top `sources` bar, alongside the
+//! source file.)
 //!
 //! The command bar mirrors `Project::to_args()` live *until the user edits it* —
 //! then it becomes an escape hatch: `InterlaceApp::command_edit` holds the edited
@@ -9,23 +13,24 @@
 //! `validate` — but only while following the model, since an edited command is
 //! the user's own business.
 
-use super::{InterlaceApp, RunState, card, section_label};
+use super::{InterlaceApp, card, section_label};
 use crate::validate::{self, Issue, Severity};
 
-pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
+/// The compatibility findings, which stay in the central column so they remain
+/// visible even when the command panel is toggled off.
+pub(super) fn show_issues(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     // Compatibility findings apply to the model, so hide them once edited.
     if app.command_edit.is_none() && let Some(project) = &app.project {
         let issues = validate::validate(project);
         if !issues.is_empty() {
             issues_card(ui, &issues);
-            ui.add_space(8.0);
         }
     }
+}
 
+/// The editable command bar, rendered into the resizable bottom panel.
+pub(super) fn show_command(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     command_card(ui, app);
-
-    ui.add_space(8.0);
-    footer(ui, app);
 }
 
 fn command_card(ui: &mut egui::Ui, app: &mut InterlaceApp) {
@@ -69,38 +74,6 @@ fn command_card(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     });
 }
 
-fn footer(ui: &mut egui::Ui, app: &mut InterlaceApp) {
-    let mut run_clicked = false;
-
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let running = matches!(app.run_state, RunState::Running { .. });
-            // With an edited command we can run even before a file is loaded.
-            let have_command = app.project.is_some() || app.command_edit.is_some();
-            let enabled = have_command && !running;
-            let label = if running { "● Running…" } else { "▶ Run" };
-            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-                run_clicked = true;
-            }
-
-            let (fraction, text, color) = progress_view(&app.run_state);
-            if let Some(color) = color {
-                // Surface a finished-run message beside the bar.
-                ui.colored_label(color, &text);
-            }
-            ui.add(
-                egui::ProgressBar::new(fraction)
-                    .desired_width(ui.available_width())
-                    .text(text),
-            );
-        });
-    });
-
-    if run_clicked {
-        app.on_run_clicked();
-    }
-}
-
 /// A card listing compatibility findings, errors (red) before warnings (amber).
 fn issues_card(ui: &mut egui::Ui, issues: &[Issue]) {
     card(ui, |ui| {
@@ -124,18 +97,4 @@ fn issues_card(ui: &mut egui::Ui, issues: &[Issue]) {
             ui.add_space(2.0);
         }
     });
-}
-
-/// Map the run state to (bar fraction, bar text, optional side-message color).
-fn progress_view(state: &RunState) -> (f32, String, Option<egui::Color32>) {
-    match state {
-        RunState::Idle => (0.0, "idle".into(), None),
-        RunState::Running { fraction, line, .. } => (*fraction, line.clone(), None),
-        RunState::Done { ok: true, line } => {
-            (1.0, line.clone(), Some(egui::Color32::from_rgb(80, 200, 120)))
-        }
-        RunState::Done { ok: false, line } => {
-            (0.0, line.clone(), Some(egui::Color32::from_rgb(220, 80, 80)))
-        }
-    }
 }
