@@ -10,30 +10,39 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-# Read the crate version out of Cargo.toml.
-$version = (Select-String -Path "$root\Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"' |
-    Select-Object -First 1).Matches[0].Groups[1].Value
+# Read the crate version out of Cargo.toml
+$version = (Select-String -Path "$root\Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
 Write-Host "Packaging Interlace v$version" -ForegroundColor Cyan
 
-# A running instance would lock the exe; stop it first.
+# A running instance would lock the exe; stop it first
 Get-Process interlace -ErrorAction SilentlyContinue | Stop-Process -Force
 
 Write-Host "Building release..." -ForegroundColor Cyan
 cargo build --release
-if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed" }
+if ($LASTEXITCODE -ne 0) 
+{ 
+    throw "cargo build --release failed"
+}
 
 $exe = "$root\target\release\interlace.exe"
-if (-not (Test-Path $exe)) { throw "expected binary not found: $exe" }
+if (-not (Test-Path $exe)) 
+{ 
+    throw "expected binary not found: $exe" 
+}
 
-# Stage the payload.
+# Stage the payload
 $stage = "$root\dist\interlace-$version-win-x64"
-if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+if (Test-Path $stage) 
+{ 
+    Remove-Item -Recurse -Force $stage 
+}
+
 New-Item -ItemType Directory -Force $stage | Out-Null
-Copy-Item $exe            $stage
+Copy-Item $exe $stage
 Copy-Item "$root\README.md" $stage
 Copy-Item "$root\assets\icon.png" "$stage\icon.png"
 
-# Zip it.
+# Zip it
 $zip = "$stage.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path "$stage\*" -DestinationPath $zip
