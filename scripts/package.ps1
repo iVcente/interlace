@@ -12,7 +12,7 @@ Set-Location $root
 
 # Read the crate version out of Cargo.toml
 $version = (Select-String -Path "$root\Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-Write-Host "Packaging Interlace v$version" -ForegroundColor Cyan
+Write-Host "Packaging interlace v$version" -ForegroundColor Cyan
 
 # A running instance would lock the exe; stop it first
 Get-Process interlace -ErrorAction SilentlyContinue | Stop-Process -Force
