@@ -7,6 +7,7 @@
 //! into an ffmpeg command line lives in `args.rs`; building one from a probed
 //! file lives in `probe.rs`.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// The stream types we care about. The letter each maps to is the stream
@@ -44,6 +45,29 @@ impl Kind {
             "data" => Kind::Data,
             _ => return None,
         })
+    }
+}
+
+/// One `-i` input file, plus a timestamp shift for syncing it against the rest.
+///
+/// The primary input (index 0) always has `offset_secs == 0.0`. An embedded track
+/// added in the editor can carry a nonzero offset, emitted as `-itsoffset` before
+/// its `-i` (see `args.rs`) to nudge it earlier or later.
+#[derive(Debug, Clone)]
+pub struct Input {
+    pub path: PathBuf,
+    /// Timestamp shift in seconds applied via `-itsoffset` (positive delays this
+    /// input, negative advances it). Always 0.0 for the primary input.
+    pub offset_secs: f64,
+}
+
+impl Input {
+    /// A plain input with no timestamp shift.
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            offset_secs: 0.0,
+        }
     }
 }
 
@@ -157,7 +181,7 @@ impl OutStream {
 /// to write.
 #[derive(Debug, Clone)]
 pub struct Project {
-    pub inputs: Vec<PathBuf>,
+    pub inputs: Vec<Input>,
     pub streams: Vec<OutStream>,
     pub output: PathBuf,
     /// Duration of the primary input in seconds, from ffprobe `-show_format`.
@@ -165,4 +189,87 @@ pub struct Project {
     /// `None` if ffprobe didn't report one.
     #[allow(dead_code)]
     pub duration_secs: Option<f64>,
+}
+
+impl Project {
+    /// Drop any non-primary input no longer referenced by *any* stream, reindexing
+    /// the `source.input` of the survivors. Called after a hard delete so that
+    /// removing the last stream of an embedded track also drops its `-i`.
+    ///
+    /// Membership is by vec presence, not liveness: a soft-`removed` stream still
+    /// pins its input (Restore must keep working), so only hard-deleted streams can
+    /// orphan one. Indices are walked high→low so each removal only shifts indices
+    /// we've already visited. Input 0 (the primary) is never pruned.
+    pub(crate) fn prune_orphan_inputs(&mut self) {
+        let used: HashSet<usize> = self.streams.iter().map(|s| s.source.input).collect();
+        for k in (1..self.inputs.len()).rev() {
+            if !used.contains(&k) {
+                self.inputs.remove(k);
+                for s in &mut self.streams {
+                    if s.source.input > k {
+                        s.source.input -= 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(input: usize) -> OutStream {
+        OutStream::new(
+            Source {
+                input,
+                index: 0,
+                kind: Kind::Audio,
+                codec: "aac".into(),
+            },
+            Meta::default(),
+            Encode::Copy,
+        )
+    }
+
+    fn project(inputs: usize, streams: Vec<OutStream>) -> Project {
+        Project {
+            inputs: (0..inputs)
+                .map(|i| Input::new(PathBuf::from(format!("in{i}.mkv"))))
+                .collect(),
+            streams,
+            output: PathBuf::from("out.mkv"),
+            duration_secs: None,
+        }
+    }
+
+    #[test]
+    fn prune_orphan_inputs_reindexes() {
+        // 3 inputs; only inputs 0 and 2 are still referenced by a stream.
+        let mut p = project(3, vec![stream(0), stream(2)]);
+        p.prune_orphan_inputs();
+
+        // Input 1 (orphaned) is dropped; the input-2 stream reindexes down to 1.
+        assert_eq!(p.inputs.len(), 2);
+        assert_eq!(p.inputs[1].path, PathBuf::from("in2.mkv"));
+        assert_eq!(p.streams[1].source.input, 1);
+    }
+
+    #[test]
+    fn prune_keeps_input_zero() {
+        // Even with no streams at all, the primary input is never pruned.
+        let mut p = project(1, vec![]);
+        p.prune_orphan_inputs();
+        assert_eq!(p.inputs.len(), 1);
+    }
+
+    #[test]
+    fn prune_by_membership_not_liveness() {
+        // A soft-removed stream still pins its input — Restore must keep working.
+        let mut removed = stream(1);
+        removed.removed = true;
+        let mut p = project(2, vec![stream(0), removed]);
+        p.prune_orphan_inputs();
+        assert_eq!(p.inputs.len(), 2, "soft-removed stream must keep its input");
+    }
 }

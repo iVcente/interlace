@@ -9,7 +9,7 @@
 //! `flags`, or a red `remove` for a stream marked for removal).
 
 use super::{InterlaceApp, badge, card};
-use crate::model::{Encode, OutStream};
+use crate::model::{Encode, Input, OutStream};
 
 const ROW_HEIGHT: f32 = 26.0;
 const COL_HANDLE: f32 = 20.0;
@@ -22,6 +22,8 @@ const C_REMOVE: egui::Color32 = egui::Color32::from_rgb(220, 80, 80);
 const C_CONVERT: egui::Color32 = egui::Color32::from_rgb(124, 58, 237);
 const C_RETAG: egui::Color32 = egui::Color32::from_rgb(217, 119, 6);
 const C_FLAGS: egui::Color32 = egui::Color32::from_rgb(37, 99, 235);
+const C_EMBED: egui::Color32 = egui::Color32::from_rgb(46, 160, 90); // green
+const C_OFFSET: egui::Color32 = egui::Color32::from_rgb(13, 148, 136); // teal
 
 pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     let selected = app.selected;
@@ -43,7 +45,10 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
         let mut rects: Vec<egui::Rect> = Vec::with_capacity(project.streams.len());
         let (_, dropped) = ui.dnd_drop_zone::<usize, ()>(egui::Frame::NONE, |ui| {
             for (i, stream) in project.streams.iter().enumerate() {
-                let rect = stream_row(ui, stream, i, selected == Some(i), &mut click);
+                // Every stream references a valid input (the model invariant), so
+                // its source input is always present.
+                let input = &project.inputs[stream.source.input];
+                let rect = stream_row(ui, stream, input, i, selected == Some(i), &mut click);
                 rects.push(rect);
             }
         });
@@ -90,6 +95,7 @@ fn header_row(ui: &mut egui::Ui) {
 fn stream_row(
     ui: &mut egui::Ui,
     s: &OutStream,
+    input: &Input,
     i: usize,
     is_selected: bool,
     click: &mut Option<usize>,
@@ -122,7 +128,7 @@ fn stream_row(
                     // Truncate to the cell so a long title can't overflow and
                     // shove the FLAGS/CHANGES columns out of alignment; the full
                     // text stays available on hover. Removed rows are struck out.
-                    let text = summary(s);
+                    let text = summary(s, input);
                     let rich = if s.removed {
                         egui::RichText::new(&text)
                             .strikethrough()
@@ -138,7 +144,7 @@ fn stream_row(
                 });
                 cell(ui, COL_ACTION, |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    for b in changes(s) {
+                    for b in changes(s, input) {
                         pill(ui, b.label, b.color, &b.hover);
                     }
                 });
@@ -237,9 +243,10 @@ struct Change {
 }
 
 /// The badges describing how `s` differs from its probed original. A removed
-/// stream shows only the red `remove` badge; otherwise any of `convert` /
-/// `retag` / `flags` that apply (empty when the stream is untouched).
-fn changes(s: &OutStream) -> Vec<Change> {
+/// stream shows only the red `remove` badge; otherwise any of `embed` / `convert`
+/// / `retag` / `flags` / `offset` that apply (empty when the stream is untouched).
+/// `input` is the stream's source input, needed for the `embed`/`offset` badges.
+fn changes(s: &OutStream, input: &Input) -> Vec<Change> {
     if s.removed {
         return vec![Change {
             label: "remove",
@@ -249,6 +256,15 @@ fn changes(s: &OutStream) -> Vec<Change> {
     }
 
     let mut out = Vec::new();
+    // An embedded external track: synthetic *and* drawn from an added input (a
+    // converted-copy sibling is also synthetic but stays on the primary input).
+    if s.added && s.source.input != 0 {
+        out.push(Change {
+            label: "embed",
+            color: C_EMBED,
+            hover: "Embedded from an added file".into(),
+        });
+    }
     if s.converted() {
         let to = match &s.encode {
             Encode::Audio { codec, .. } => codec.as_str(),
@@ -278,6 +294,14 @@ fn changes(s: &OutStream) -> Vec<Change> {
                 on_off(s.orig_meta.forced),
                 on_off(s.meta.forced),
             ),
+        });
+    }
+    // A sync offset on the source input (gated on integer ms, like `to_args`).
+    if (input.offset_secs * 1000.0).round() as i64 != 0 {
+        out.push(Change {
+            label: "offset",
+            color: C_OFFSET,
+            hover: format!("timestamps shifted {:+.3} s", input.offset_secs),
         });
     }
     out
@@ -314,9 +338,9 @@ fn opt(v: &Option<String>) -> String {
     }
 }
 
-/// Stream summary, mirroring the mockup: `flac » aac · jpn · "Japanese"` or
-/// `subrip · eng · from 2`.
-fn summary(s: &OutStream) -> String {
+/// Stream summary, mirroring the mockup: `flac » aac · jpn · "Japanese"` or, for
+/// an embedded track, `subrip · eng · from subs.srt · +0.15s`.
+fn summary(s: &OutStream, input: &Input) -> String {
     let mut parts: Vec<String> = Vec::new();
     match &s.encode {
         Encode::Copy => parts.push(s.source.codec.clone()),
@@ -328,10 +352,26 @@ fn summary(s: &OutStream) -> String {
     if let Some(title) = &s.meta.title {
         parts.push(format!("\u{201C}{title}\u{201D}"));
     }
+    // Embedded tracks come from a non-primary input: name the file it came from,
+    // and its sync offset if one is set.
     if s.source.input != 0 {
-        parts.push(format!("from {}", s.source.input));
+        let name = input
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("input {}", s.source.input));
+        parts.push(format!("from {name}"));
+        if (input.offset_secs * 1000.0).round() as i64 != 0 {
+            parts.push(format!("{:+}s", trim_offset(input.offset_secs)));
+        }
     }
     parts.join(" · ")
+}
+
+/// The offset in seconds with trailing-zero noise trimmed, for a compact summary
+/// (`0.15` not `0.150`). Rounded to the millisecond the command actually uses.
+fn trim_offset(secs: f64) -> f64 {
+    ((secs * 1000.0).round()) / 1000.0
 }
 
 fn flags(s: &OutStream) -> String {
@@ -343,4 +383,59 @@ fn flags(s: &OutStream) -> String {
         f.push("forced");
     }
     f.join(" · ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Kind, Meta, Source};
+    use std::path::PathBuf;
+
+    fn out(input: usize, added: bool, meta: Meta) -> OutStream {
+        let mut s = OutStream::new(
+            Source { input, index: 0, kind: Kind::Subtitle, codec: "subrip".into() },
+            meta,
+            Encode::Copy,
+        );
+        s.added = added;
+        s
+    }
+
+    fn input(name: &str, offset_secs: f64) -> Input {
+        Input { path: PathBuf::from(name), offset_secs }
+    }
+
+    fn labels(cs: &[Change]) -> Vec<&str> {
+        cs.iter().map(|c| c.label).collect()
+    }
+
+    #[test]
+    fn embedded_summary_names_file_and_offset() {
+        let s = out(1, true, Meta { language: Some("eng".into()), ..Default::default() });
+        let text = summary(&s, &input("/media/subs.srt", 0.15));
+        assert_eq!(text, "subrip · eng · from subs.srt · +0.15s");
+    }
+
+    #[test]
+    fn embedded_summary_without_offset_omits_it() {
+        let s = out(1, true, Meta::default());
+        let text = summary(&s, &input("subs.srt", 0.0));
+        assert_eq!(text, "subrip · from subs.srt");
+    }
+
+    #[test]
+    fn embed_and_offset_badges_on_embedded_track() {
+        let s = out(1, true, Meta::default());
+        assert_eq!(labels(&changes(&s, &input("subs.srt", -0.2))), ["embed", "offset"]);
+    }
+
+    #[test]
+    fn no_embed_badge_for_primary_input_or_converted_sibling() {
+        // A synthetic convert-sibling stays on input 0 → not an embed.
+        let sibling = out(0, true, Meta::default());
+        assert!(!labels(&changes(&sibling, &input("in.mkv", 0.0))).contains(&"embed"));
+        // A plain probed primary stream → no badges at all.
+        let primary = out(0, false, Meta::default());
+        assert!(changes(&primary, &input("in.mkv", 0.0)).is_empty());
+    }
 }

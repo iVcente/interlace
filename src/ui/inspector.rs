@@ -62,8 +62,10 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
             return;
         }
 
-        // Compute the type-relative index before taking the &mut borrow.
+        // Compute the type-relative index and source input before the &mut borrow
+        // (both are Copy, so they outlive the borrow of `project.streams`).
         let kind = project.streams[idx].source.kind;
+        let input_idx = project.streams[idx].source.input;
         let type_rel = project.streams[..idx]
             .iter()
             .filter(|s| s.source.kind == kind)
@@ -125,58 +127,63 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
         });
 
         // ── Section 2: conversion ────────────────────────────────────────────
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(6.0);
-        super::section_label(ui, "CONVERSION");
-        ui.add_space(6.0);
-        ui.add_enabled_ui(!stream.removed, |ui| {
-            if kind != Kind::Audio {
-                ui.weak("Only audio streams can be converted.");
-                return;
-            }
-            if matches!(stream.encode, Encode::Copy) {
-                // A plain copy: offer the two ways to convert.
-                ui.weak("Re-encode this audio to another codec.");
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("convert in place")
-                        .on_hover_text("Replace this stream with a re-encoded version (drops the original codec)")
-                        .clicked()
-                    {
-                        stream.encode = Encode::default_audio();
-                    }
-                    if ui
-                        .button("add as new stream")
-                        .on_hover_text("Keep this stream and add a converted copy you can reorder and tag")
-                        .clicked()
-                    {
-                        add_converted = true;
-                    }
-                });
-            } else {
-                // Already converting: tune the codec inline.
-                ui.horizontal(|ui| {
-                    field(ui, "codec", |ui| convert_combo(ui, stream));
-                    field(ui, "bitrate", |ui| bitrate_combo(ui, stream));
-                    field(ui, "channels", |ui| channels_combo(ui, stream));
-                });
-                // An original stream can drop back to stream-copy; a synthetic
-                // added copy can't (that would just duplicate its source) — it's
-                // removed outright in the actions section instead.
-                if !stream.added {
+        // Only for the file's own streams. An imported track is embedded as-is —
+        // re-encoding what you're bringing in doesn't fit that flow — so the whole
+        // section is hidden for streams drawn from an added input.
+        if input_idx == 0 {
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+            super::section_label(ui, "CONVERSION");
+            ui.add_space(6.0);
+            ui.add_enabled_ui(!stream.removed, |ui| {
+                if kind != Kind::Audio {
+                    ui.weak("Only audio streams can be converted.");
+                    return;
+                }
+                if matches!(stream.encode, Encode::Copy) {
+                    // A plain copy: offer the two ways to convert.
+                    ui.weak("Re-encode this audio to another codec.");
                     ui.add_space(6.0);
-                    if ui
-                        .button("revert to copy")
-                        .on_hover_text("Stop converting; stream-copy the original")
-                        .clicked()
-                    {
-                        stream.encode = Encode::Copy;
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("convert in place")
+                            .on_hover_text("Replace this stream with a re-encoded version (drops the original codec)")
+                            .clicked()
+                        {
+                            stream.encode = Encode::default_audio();
+                        }
+                        if ui
+                            .button("add as new stream")
+                            .on_hover_text("Keep this stream and add a converted copy you can reorder and tag")
+                            .clicked()
+                        {
+                            add_converted = true;
+                        }
+                    });
+                } else {
+                    // Already converting: tune the codec inline.
+                    ui.horizontal(|ui| {
+                        field(ui, "codec", |ui| convert_combo(ui, stream));
+                        field(ui, "bitrate", |ui| bitrate_combo(ui, stream));
+                        field(ui, "channels", |ui| channels_combo(ui, stream));
+                    });
+                    // An original stream can drop back to stream-copy; a synthetic
+                    // added copy can't (that would just duplicate its source) — it's
+                    // removed outright in the actions section instead.
+                    if !stream.added {
+                        ui.add_space(6.0);
+                        if ui
+                            .button("revert to copy")
+                            .on_hover_text("Stop converting; stream-copy the original")
+                            .clicked()
+                        {
+                            stream.encode = Encode::Copy;
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
 
         // ── Section 3: actions ───────────────────────────────────────────────
         ui.add_space(8.0);
@@ -238,6 +245,39 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
                     }
                 }
             });
+        }
+
+        // ── Section 4: sync offset (embedded tracks only) ────────────────────
+        // Only added inputs (index > 0) can be shifted; the primary is the clock
+        // everything else syncs against. `stream`'s borrow is dead by here, so we
+        // can reborrow `project.inputs`.
+        if input_idx != 0 {
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+            super::section_label(ui, "SYNC OFFSET");
+            ui.add_space(6.0);
+            let input = &mut project.inputs[input_idx];
+            ui.horizontal(|ui| {
+                if ui.button("−").on_hover_text("Advance 0.05 s").clicked() {
+                    input.offset_secs -= 0.05;
+                }
+                ui.add(
+                    egui::DragValue::new(&mut input.offset_secs)
+                        .suffix(" s")
+                        .speed(0.01)
+                        .max_decimals(3)
+                        .range(-3600.0..=3600.0),
+                );
+                if ui.button("+").on_hover_text("Delay 0.05 s").clicked() {
+                    input.offset_secs += 0.05;
+                }
+                if ui.button("⟲").on_hover_text("Reset to 0").clicked() {
+                    input.offset_secs = 0.0;
+                }
+            });
+            ui.add_space(4.0);
+            ui.weak("+ delays this track, − advances it.");
         }
     });
 

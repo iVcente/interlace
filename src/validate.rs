@@ -169,7 +169,7 @@ fn is_mp4_subtitle(codec: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Meta, Source};
+    use crate::model::{Input, Meta, Source};
     use std::path::PathBuf;
 
     fn stream(kind: Kind, codec: &str, encode: Encode) -> OutStream {
@@ -182,7 +182,7 @@ mod tests {
 
     fn project(output: &str, streams: Vec<OutStream>) -> Project {
         Project {
-            inputs: vec![PathBuf::from("in.mkv")],
+            inputs: vec![Input::new(PathBuf::from("in.mkv"))],
             streams,
             output: PathBuf::from(output),
             duration_secs: None,

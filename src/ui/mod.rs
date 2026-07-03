@@ -118,6 +118,24 @@ impl InterlaceApp {
         }
     }
 
+    /// Embed an external audio/subtitle track from `path` as a new input of the
+    /// current project, selecting it. With no project loaded there's nothing to
+    /// embed into, so we treat it as opening a primary file instead. A hand-edited
+    /// command is left untouched (the model diverging from it is expected).
+    pub fn embed_file(&mut self, path: PathBuf) {
+        let Some(project) = self.project.as_mut() else {
+            self.load_file(path);
+            return;
+        };
+        match project.append_input(&self.ffprobe, &path) {
+            Ok(i) => {
+                self.selected = Some(i);
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
     // --- model mutations (called by the table/inspector after rendering) -----
 
     /// Add a re-encoded sibling of `streams[i]`: the same source, a default AAC
@@ -147,6 +165,8 @@ impl InterlaceApp {
             return;
         }
         p.streams.remove(i);
+        // Dropping the last stream of an embedded track also drops its `-i`.
+        p.prune_orphan_inputs();
         let len = p.streams.len();
         self.selected = match self.selected {
             _ if len == 0 => None,
@@ -547,10 +567,25 @@ pub(super) fn pick_media_file() -> Option<PathBuf> {
         .pick_file()
 }
 
+/// Open a native file picker for an embeddable track. Filtered to audio and
+/// subtitle files only — you embed one external track, not another container.
+pub(super) fn pick_track_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter(
+            "Audio or subtitle",
+            &[
+                "srt", "ass", "ssa", "vtt", "sup", "sub", // subtitles
+                "flac", "aac", "ac3", "eac3", "dts", "mp3", "opus", "ogg", "wav", "m4a", "thd",
+                "mka", // audio
+            ],
+        )
+        .pick_file()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Meta, Source};
+    use crate::model::{Input, Meta, Source};
 
     fn demo_project() -> Project {
         let mk = |input, index, kind, codec: &str, meta| {
@@ -561,7 +596,7 @@ mod tests {
             )
         };
         Project {
-            inputs: vec![PathBuf::from("movie.mkv")],
+            inputs: vec![Input::new(PathBuf::from("movie.mkv"))],
             streams: vec![
                 mk(0, 0, Kind::Video, "h264", Meta::default()),
                 mk(0, 1, Kind::Audio, "flac", Meta {
@@ -628,6 +663,59 @@ mod tests {
             .map(|w| w[1].clone())
             .collect();
         assert_eq!(maps.iter().filter(|m| *m == "0:1").count(), 2);
+    }
+
+    /// An embedded track is a second input plus one `added` stream referencing it.
+    /// Deleting that stream must drop the now-orphan input, and the surviving
+    /// streams must all still reference input 0.
+    #[test]
+    fn delete_embedded_stream_prunes_input() {
+        let mut app = app_with_demo(); // 3 streams, all from input 0
+        {
+            let p = app.project.as_mut().unwrap();
+            p.inputs.push(Input {
+                path: PathBuf::from("subs.srt"),
+                offset_secs: -0.2,
+            });
+            let mut embedded = OutStream::new(
+                Source { input: 1, index: 0, kind: Kind::Subtitle, codec: "subrip".into() },
+                Meta { language: Some("eng".into()), ..Default::default() },
+                Encode::Copy,
+            );
+            embedded.added = true;
+            p.streams.push(embedded);
+        }
+        let last = app.project.as_ref().unwrap().streams.len() - 1;
+        app.selected = Some(last);
+        app.delete_stream(last);
+
+        let p = app.project.as_ref().unwrap();
+        assert_eq!(p.inputs.len(), 1, "orphan input pruned");
+        assert!(p.streams.iter().all(|s| s.source.input == 0));
+    }
+
+    #[test]
+    fn renders_embedded_stream_with_offset() {
+        // A second input with a sync offset and its embedded stream selected —
+        // exercises the inspector's SYNC OFFSET section and the "from 1" summary.
+        let mut app = app_with_demo();
+        {
+            let p = app.project.as_mut().unwrap();
+            p.inputs.push(Input {
+                path: PathBuf::from("commentary.flac"),
+                offset_secs: 0.15,
+            });
+            let mut embedded = OutStream::new(
+                Source { input: 1, index: 0, kind: Kind::Audio, codec: "flac".into() },
+                Meta::default(),
+                Encode::Copy,
+            );
+            embedded.added = true;
+            p.streams.push(embedded);
+        }
+        app.selected = Some(app.project.as_ref().unwrap().streams.len() - 1);
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
 
     #[test]
@@ -735,7 +823,7 @@ mod tests {
                 _ => 0,
             }
         }
-        let mut reds = |app: &mut InterlaceApp| {
+        let reds = |app: &mut InterlaceApp| {
             let out = ctx.run_ui(input(), |ui| app.render(ui));
             out.shapes.iter().map(|s| count_red(&s.shape, red)).sum::<usize>()
         };

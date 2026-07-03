@@ -41,9 +41,17 @@ impl Project {
         let mut a: Vec<String> = Vec::new();
 
         // Inputs, in order — their position defines the `-i` index streams refer to.
+        // A synced input gets `-itsoffset <secs>` right before its `-i`. We gate on
+        // integer milliseconds so tiny float noise never emits a spurious offset,
+        // and format with a fixed `.` decimal (locale-independent, no `1e-1` forms).
         for input in &self.inputs {
+            let ms = (input.offset_secs * 1000.0).round() as i64;
+            if ms != 0 {
+                a.push("-itsoffset".into());
+                a.push(format!("{:.3}", ms as f64 / 1000.0)); // e.g. "0.200", "-0.150"
+            }
             a.push("-i".into());
-            a.push(input.display().to_string());
+            a.push(input.path.display().to_string());
         }
 
         // Only streams not marked for removal reach the output; a removed stream
@@ -163,7 +171,7 @@ mod tests {
 
     fn project(inputs: &[&str], streams: Vec<OutStream>) -> Project {
         Project {
-            inputs: inputs.iter().map(PathBuf::from).collect(),
+            inputs: inputs.iter().map(|p| Input::new(PathBuf::from(p))).collect(),
             streams,
             output: PathBuf::from("out.mkv"),
             duration_secs: None,
@@ -325,5 +333,50 @@ mod tests {
         assert!(joined.contains("-c:a:0 copy"), "{joined}");
         assert!(!joined.contains("-disposition"), "no disposition: {joined}");
         assert!(!joined.contains("-metadata"), "no metadata: {joined}");
+    }
+
+    /// An embedded input's offset emits `-itsoffset` *immediately before* that
+    /// input's `-i` (and only that one) — the placement ffmpeg requires.
+    #[test]
+    fn itsoffset_emitted_before_input() {
+        let v = keep(src(0, 0, Kind::Video, "h264"), Meta::default());
+        let sub = OutStream::new(src(1, 0, Kind::Subtitle, "subrip"), lang("eng"), Encode::Copy);
+
+        let mut p = project(&["vid.mkv", "subs.srt"], vec![v, sub]);
+        p.inputs[1].offset_secs = -0.2; // advance the subtitle by 200ms
+        let args = p.to_args();
+
+        // The token right before the second `-i` is the offset; the first `-i` has none.
+        let i_positions: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == "-i")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(i_positions.len(), 2);
+        // The primary has no offset, so its `-i` is the very first token.
+        assert_eq!(i_positions[0], 0, "no offset on the primary");
+        // The second input is preceded by `-itsoffset <value> -i`.
+        assert_eq!(args[i_positions[1] - 2], "-itsoffset");
+        assert_eq!(args[i_positions[1] - 1], "-0.200");
+        assert_eq!(values_after(&args, "-itsoffset"), ["-0.200"]);
+    }
+
+    /// A zero offset (the default for every input) emits nothing.
+    #[test]
+    fn no_itsoffset_when_zero() {
+        let v = keep(src(0, 0, Kind::Video, "h264"), Meta::default());
+        let joined = project(&["in.mkv"], vec![v]).to_args().join(" ");
+        assert!(!joined.contains("-itsoffset"), "{joined}");
+    }
+
+    /// The offset formats with a fixed 3-decimal `.` — no `0.30000000000000004`.
+    #[test]
+    fn itsoffset_formats_without_float_noise() {
+        let v = keep(src(0, 0, Kind::Video, "h264"), Meta::default());
+        let a = keep(src(1, 0, Kind::Audio, "flac"), Meta::default());
+        let mut p = project(&["vid.mkv", "extra.flac"], vec![v, a]);
+        p.inputs[1].offset_secs = 0.3;
+        assert_eq!(values_after(&p.to_args(), "-itsoffset"), ["0.300"]);
     }
 }

@@ -8,7 +8,7 @@
 //! compose. Container fallbacks (`.mka`/`.mks`/`.mkv`) are used when a codec has
 //! no clean elementary muxer; those do carry the tags, which is fine.
 
-use crate::model::{Encode, Kind, OutStream, Project, Source};
+use crate::model::{Encode, Input, Kind, OutStream, Project, Source};
 use std::path::{Path, PathBuf};
 
 impl Project {
@@ -20,7 +20,7 @@ impl Project {
         if matches!(s.source.kind, Kind::Attachment | Kind::Data) {
             return None;
         }
-        let input = self.inputs.get(s.source.input)?.clone();
+        let input = self.inputs.get(s.source.input)?.path.clone();
         let ext = natural_extension(s.source.kind, &s.source.codec);
         let output = extract_output_path(&input, s, idx, ext);
 
@@ -37,8 +37,10 @@ impl Project {
             Encode::Copy, // extraction never re-encodes
         );
 
+        // A fresh single-input project: the offset resets to 0 (nothing to sync
+        // against once the stream stands alone).
         Some(Project {
-            inputs: vec![input],
+            inputs: vec![Input::new(input)],
             streams: vec![stream],
             output,
             duration_secs: self.duration_secs,
@@ -115,7 +117,7 @@ mod tests {
 
     fn project(streams: Vec<OutStream>) -> Project {
         Project {
-            inputs: vec![PathBuf::from("/media/movie.mkv")],
+            inputs: vec![Input::new(PathBuf::from("/media/movie.mkv"))],
             streams,
             output: PathBuf::from("/media/movie.remux.mkv"),
             duration_secs: Some(90.0),
@@ -158,6 +160,20 @@ mod tests {
     fn extract_attachment_is_unsupported() {
         let p = project(vec![stream(0, 4, Kind::Attachment, "ttf", None)]);
         assert!(p.extract(0).is_none());
+    }
+
+    #[test]
+    fn extract_resets_offset() {
+        // A second input with a sync offset, and a stream drawn from it.
+        let mut p = project(vec![stream(1, 0, Kind::Audio, "flac", Some("eng"))]);
+        p.inputs.push(Input {
+            path: PathBuf::from("/media/extra.flac"),
+            offset_secs: -0.2,
+        });
+        let x = p.extract(0).unwrap();
+        // The extracted single-input project carries no offset.
+        assert_eq!(x.inputs[0].offset_secs, 0.0);
+        assert!(!x.to_args().join(" ").contains("-itsoffset"));
     }
 
     #[test]

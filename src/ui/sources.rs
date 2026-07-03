@@ -1,31 +1,34 @@
-//! The top bar: one chip per loaded input file, the "add file", command-panel
-//! (⌨) and settings (⚙) buttons on the right, and — on the row below — the Run
-//! button and progress bar so the primary action sits with the source, not at
-//! the bottom of the page.
+//! The top bar: one chip per loaded input file, the "add file" / "add track",
+//! command-panel (⌨) and settings (⚙) buttons on the right, and — on the row
+//! below — the Run button and progress bar so the primary action sits with the
+//! source, not at the bottom of the page.
 //!
-//! M3 loads a single primary file, shown as a chip. Appending *additional*
-//! inputs (true stream insertion) is M4, so for now "add file" opens a picker
-//! and loads it as the primary project.
+//! "+ add file" opens a picker and loads it as the primary project (replacing any
+//! current one). "+ add track" — shown only once a file is loaded — appends an
+//! external audio or subtitle file as an additional input, embedding its single
+//! track into the current project (see `InterlaceApp::embed_file`).
 
-use super::{InterlaceApp, RunState, card, pick_media_file};
+use super::{InterlaceApp, RunState, card, pick_media_file, pick_track_file};
 
 pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     let mut open_requested = false;
+    let mut embed_requested = false;
     let mut toggle_settings = false;
     let mut toggle_command = false;
 
     card(ui, |ui| {
         ui.horizontal(|ui| {
             if let Some(project) = &app.project {
-                for path in &project.inputs {
-                    let name = path
+                for input in &project.inputs {
+                    let name = input
+                        .path
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.display().to_string());
+                        .unwrap_or_else(|| input.path.display().to_string());
                     chip(ui, &name);
                 }
             }
-            // Add-file and settings sit together on the right of the same row.
+            // Add-file/-track and settings sit together on the right of the row.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("⚙").on_hover_text("Binaries / settings").clicked() {
                     toggle_settings = true;
@@ -39,6 +42,15 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
                 }
                 if ui.button("+ add file").clicked() {
                     open_requested = true;
+                }
+                // Embedding needs something to embed into.
+                if app.project.is_some()
+                    && ui
+                        .button("+ add track")
+                        .on_hover_text("Embed an external audio or subtitle track")
+                        .clicked()
+                {
+                    embed_requested = true;
                 }
             });
         });
@@ -55,9 +67,12 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     if toggle_command {
         app.show_command = !app.show_command;
     }
-    // Run the (blocking) native dialog after the borrow of `app` ends.
+    // Run the (blocking) native dialogs after the borrow of `app` ends.
     if open_requested && let Some(path) = pick_media_file() {
         app.load_file(path);
+    }
+    if embed_requested && let Some(path) = pick_track_file() {
+        app.embed_file(path);
     }
 }
 
