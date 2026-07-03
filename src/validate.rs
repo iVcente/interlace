@@ -169,12 +169,12 @@ fn is_mp4_subtitle(codec: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Input, Meta, Source};
+    use crate::model::{Bitrate, Input, Meta, Source};
     use std::path::PathBuf;
 
     fn stream(kind: Kind, codec: &str, encode: Encode) -> OutStream {
         OutStream::new(
-            Source { input: 0, index: 0, kind, codec: codec.into() },
+            Source { input: 0, index: 0, kind, codec: codec.into(), bitrate_kbps: None },
             Meta::default(),
             encode,
         )
@@ -224,7 +224,7 @@ mod tests {
             stream(Kind::Video, "vp9", Encode::Copy),
             stream(Kind::Audio, "aac", Encode::Audio {
                 codec: "opus".into(),
-                bitrate_kbps: Some(192),
+                bitrate: Bitrate::Fixed(192),
                 channels: None,
             }),
         ]);

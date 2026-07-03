@@ -27,6 +27,10 @@ struct RawStream {
     codec_type: String,
     #[serde(default)]
     codec_name: String,
+    /// Bits per second as a decimal string, e.g. "128000". Absent for some
+    /// streams (notably lossless/variable). Parsed to kbps in `map_probe_streams`.
+    #[serde(default)]
+    bit_rate: Option<String>,
     #[serde(default)]
     tags: RawTags,
     #[serde(default)]
@@ -103,6 +107,12 @@ fn map_probe_streams(streams: &[RawStream], input: usize) -> Vec<OutStream> {
                 index: rs.index,
                 kind,
                 codec: rs.codec_name.clone(),
+                // bits/sec → kbps, rounded to nearest; `None` if absent/unparseable.
+                bitrate_kbps: rs
+                    .bit_rate
+                    .as_deref()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(|bps| ((bps + 500) / 1000) as u32),
             },
             Meta {
                 language: rs.tags.language.clone(),
@@ -193,6 +203,7 @@ mod tests {
             index,
             codec_type: codec_type.into(),
             codec_name: codec_name.into(),
+            bit_rate: None,
             tags: RawTags::default(),
             disposition: RawDisposition::default(),
         }
@@ -213,5 +224,16 @@ mod tests {
         // Absolute ffprobe indices are preserved (the audio keeps index 1).
         assert_eq!(streams[1].source.index, 1);
         assert_eq!(streams[1].source.kind, Kind::Audio);
+    }
+
+    #[test]
+    fn map_probe_streams_parses_source_bitrate_to_kbps() {
+        let mut audio = raw(0, "audio", "aac");
+        audio.bit_rate = Some("137599".into()); // bits/sec → 138 kbps (rounded)
+        let no_rate = raw(1, "audio", "flac"); // absent → None
+
+        let streams = map_probe_streams(&[audio, no_rate], 0);
+        assert_eq!(streams[0].source.bitrate_kbps, Some(138));
+        assert_eq!(streams[1].source.bitrate_kbps, None);
     }
 }

@@ -83,12 +83,14 @@ impl Project {
                 }
                 Encode::Audio {
                     codec,
-                    bitrate_kbps,
+                    bitrate,
                     channels,
                 } => {
                     a.push(format!("-c:{spec}"));
                     a.push(codec.clone());
-                    if let Some(b) = bitrate_kbps {
+                    // `Auto` follows the probed source bitrate; `Default` resolves
+                    // to `None` and emits no `-b` at all (encoder default).
+                    if let Some(b) = bitrate.resolve(s.source.bitrate_kbps) {
                         a.push(format!("-b:{spec}"));
                         a.push(format!("{b}k"));
                     }
@@ -155,6 +157,7 @@ mod tests {
             index,
             kind,
             codec: codec.into(),
+            bitrate_kbps: None,
         }
     }
 
@@ -252,7 +255,7 @@ mod tests {
             Meta::default(),
             Encode::Audio {
                 codec: "aac".into(),
-                bitrate_kbps: Some(192),
+                bitrate: Bitrate::Fixed(192),
                 channels: Some(2),
             },
         );
@@ -264,6 +267,55 @@ mod tests {
             joined.contains("-c:a:0 aac -b:a:0 192k -ac:a:0 2"),
             "{joined}"
         );
+    }
+
+    /// AUTO follows the probed source bitrate, ceiling it up to the ladder: a
+    /// 137k source becomes a 160k target.
+    #[test]
+    fn auto_bitrate_follows_source_ceiled_to_ladder() {
+        let v = keep(src(0, 0, Kind::Video, "h264"), Meta::default());
+        let mut source = src(0, 1, Kind::Audio, "aac");
+        source.bitrate_kbps = Some(137);
+        let audio = OutStream::new(
+            source,
+            Meta::default(),
+            Encode::Audio {
+                codec: "opus".into(),
+                bitrate: Bitrate::Auto,
+                channels: None,
+            },
+        );
+
+        let joined = project(&["in.mkv"], vec![v, audio]).to_args().join(" ");
+        assert!(joined.contains("-c:a:0 opus -b:a:0 160k"), "{joined}");
+    }
+
+    /// AUTO with an unknown source bitrate, and DEFAULT, both emit no `-b` flag.
+    #[test]
+    fn auto_without_source_and_default_omit_bitrate() {
+        let v = keep(src(0, 0, Kind::Video, "h264"), Meta::default());
+        let auto = OutStream::new(
+            src(0, 1, Kind::Audio, "aac"), // bitrate_kbps: None
+            Meta::default(),
+            Encode::Audio {
+                codec: "opus".into(),
+                bitrate: Bitrate::Auto,
+                channels: None,
+            },
+        );
+        let default = OutStream::new(
+            src(0, 2, Kind::Audio, "aac"),
+            Meta::default(),
+            Encode::Audio {
+                codec: "opus".into(),
+                bitrate: Bitrate::Default,
+                channels: None,
+            },
+        );
+
+        let args = project(&["in.mkv"], vec![v, auto, default]).to_args();
+        assert!(values_after(&args, "-b:a:0").is_empty(), "{args:?}");
+        assert!(values_after(&args, "-b:a:1").is_empty(), "{args:?}");
     }
 
     /// Insert from a second input: two `-i`, a stream referencing input 1, and

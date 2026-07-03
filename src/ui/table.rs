@@ -393,7 +393,7 @@ mod tests {
 
     fn out(input: usize, added: bool, meta: Meta) -> OutStream {
         let mut s = OutStream::new(
-            Source { input, index: 0, kind: Kind::Subtitle, codec: "subrip".into() },
+            Source { input, index: 0, kind: Kind::Subtitle, codec: "subrip".into(), bitrate_kbps: None },
             meta,
             Encode::Copy,
         );

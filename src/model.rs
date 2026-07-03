@@ -82,6 +82,47 @@ pub struct Source {
     /// Display only, e.g. "flac". Surfaced in the stream table (M3).
     #[allow(dead_code)]
     pub codec: String,
+    /// The source stream's measured bitrate in kbps, if ffprobe reported one.
+    /// Used by `Bitrate::Auto` to follow the source; `None` when unknown.
+    pub bitrate_kbps: Option<u32>,
+}
+
+/// The standard audio bitrate ladder (kbps), ascending. Shared by the inspector's
+/// selectable list and `Bitrate::Auto`'s ceil-to-source logic.
+pub const BITRATE_LADDER: [u32; 6] = [96, 128, 160, 192, 256, 320];
+
+/// The target bitrate for an audio conversion.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Bitrate {
+    /// Follow the source: ceil its bitrate up to the next `BITRATE_LADDER` rung
+    /// (saturating at the top), never downgrading. Falls back to `Default` when
+    /// the source bitrate is unknown.
+    Auto,
+    /// Let the encoder pick — emit no `-b` flag.
+    Default,
+    /// An explicit target in kbps.
+    Fixed(u32),
+}
+
+impl Bitrate {
+    /// The concrete kbps target to emit, or `None` to omit `-b` entirely (encoder
+    /// default). `source_kbps` is the probed source bitrate, if known.
+    pub fn resolve(&self, source_kbps: Option<u32>) -> Option<u32> {
+        match self {
+            Bitrate::Default => None,
+            Bitrate::Fixed(b) => Some(*b),
+            Bitrate::Auto => source_kbps.map(ceil_to_ladder),
+        }
+    }
+}
+
+/// Smallest `BITRATE_LADDER` rung `>= kbps`, saturating at the top rung.
+fn ceil_to_ladder(kbps: u32) -> u32 {
+    BITRATE_LADDER
+        .iter()
+        .copied()
+        .find(|&r| r >= kbps)
+        .unwrap_or(*BITRATE_LADDER.last().unwrap())
 }
 
 /// How to encode a stream. `Copy` is the lossless fast path for everything
@@ -93,7 +134,7 @@ pub enum Encode {
     /// controls.
     Audio {
         codec: String,
-        bitrate_kbps: Option<u32>,
+        bitrate: Bitrate,
         channels: Option<u32>,
     },
 }
@@ -104,7 +145,7 @@ impl Encode {
     pub fn default_audio() -> Self {
         Encode::Audio {
             codec: "aac".into(),
-            bitrate_kbps: Some(192),
+            bitrate: Bitrate::Fixed(192),
             channels: None,
         }
     }
@@ -226,6 +267,7 @@ mod tests {
                 index: 0,
                 kind: Kind::Audio,
                 codec: "aac".into(),
+                bitrate_kbps: None,
             },
             Meta::default(),
             Encode::Copy,
@@ -271,5 +313,28 @@ mod tests {
         let mut p = project(2, vec![stream(0), removed]);
         p.prune_orphan_inputs();
         assert_eq!(p.inputs.len(), 2, "soft-removed stream must keep its input");
+    }
+
+    #[test]
+    fn auto_bitrate_ceils_to_ladder_never_downgrading() {
+        // On-rung stays put; between-rungs rounds up; above the top saturates.
+        assert_eq!(Bitrate::Auto.resolve(Some(96)), Some(96));
+        assert_eq!(Bitrate::Auto.resolve(Some(128)), Some(128));
+        assert_eq!(Bitrate::Auto.resolve(Some(137)), Some(160));
+        assert_eq!(Bitrate::Auto.resolve(Some(192)), Some(192));
+        assert_eq!(Bitrate::Auto.resolve(Some(210)), Some(256));
+        assert_eq!(Bitrate::Auto.resolve(Some(900)), Some(320));
+    }
+
+    #[test]
+    fn auto_bitrate_without_source_falls_back_to_default() {
+        assert_eq!(Bitrate::Auto.resolve(None), None);
+    }
+
+    #[test]
+    fn default_and_fixed_bitrate_ignore_source() {
+        assert_eq!(Bitrate::Default.resolve(Some(256)), None);
+        assert_eq!(Bitrate::Fixed(192).resolve(Some(256)), Some(192));
+        assert_eq!(Bitrate::Fixed(192).resolve(None), Some(192));
     }
 }

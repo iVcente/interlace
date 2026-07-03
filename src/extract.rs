@@ -32,6 +32,7 @@ impl Project {
                 index: s.source.index,
                 kind: s.source.kind,
                 codec: s.source.codec.clone(),
+                bitrate_kbps: s.source.bitrate_kbps,
             },
             s.meta.clone(),
             Encode::Copy, // extraction never re-encodes
@@ -109,7 +110,7 @@ mod tests {
 
     fn stream(input: usize, index: usize, kind: Kind, codec: &str, lang: Option<&str>) -> OutStream {
         OutStream::new(
-            Source { input, index, kind, codec: codec.into() },
+            Source { input, index, kind, codec: codec.into(), bitrate_kbps: None },
             Meta { language: lang.map(Into::into), ..Default::default() },
             Encode::Copy,
         )

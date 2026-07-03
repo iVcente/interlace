@@ -10,10 +10,9 @@
 //! it) so the change is visible in the table and reversible via Restore.
 
 use super::{InterlaceApp, card, section_label};
-use crate::model::{Encode, Kind, OutStream};
+use crate::model::{BITRATE_LADDER, Bitrate, Encode, Kind, OutStream};
 
 const CODECS: [&str; 5] = ["aac", "ac3", "opus", "flac", "mp3"];
-const BITRATES: [u32; 6] = [96, 128, 160, 192, 256, 320];
 const CHANNELS: [(Option<u32>, &str); 4] = [
     (None, "source"),
     (Some(1), "1 (mono)"),
@@ -325,24 +324,39 @@ fn convert_combo(ui: &mut egui::Ui, stream: &mut OutStream) {
 }
 
 fn bitrate_combo(ui: &mut egui::Ui, stream: &mut OutStream) {
+    // Grab the probed source bitrate before the mutable borrow of `encode` so the
+    // "auto" label can preview the rung it would follow to.
+    let source_kbps = stream.source.bitrate_kbps;
     // Only meaningful for a lossy audio conversion.
-    let Encode::Audio { codec, bitrate_kbps, .. } = &mut stream.encode else {
+    let Encode::Audio { codec, bitrate, .. } = &mut stream.encode else {
         ui.add_enabled(false, egui::Button::new("—"));
         return;
     };
     let lossy = codec != "flac";
-    let text = bitrate_kbps.map(|b| format!("{b}k")).unwrap_or_else(|| "auto".into());
+    let text = match bitrate {
+        // Show the concrete rung AUTO resolves to, e.g. "auto (192k)"; plain
+        // "auto" when the source bitrate is unknown (falls back to default).
+        Bitrate::Auto => match Bitrate::Auto.resolve(source_kbps) {
+            Some(v) => format!("auto ({v}k)"),
+            None => "auto".into(),
+        },
+        Bitrate::Default => "default".into(),
+        Bitrate::Fixed(b) => format!("{b}k"),
+    };
     ui.add_enabled_ui(lossy, |ui| {
         egui::ComboBox::from_id_salt("bitrate")
             .selected_text(text)
-            .width(84.0)
+            .width(96.0)
             .show_ui(ui, |ui| {
-                if ui.selectable_label(bitrate_kbps.is_none(), "auto").clicked() {
-                    *bitrate_kbps = None;
+                if ui.selectable_label(*bitrate == Bitrate::Auto, "auto").clicked() {
+                    *bitrate = Bitrate::Auto;
                 }
-                for b in BITRATES {
-                    if ui.selectable_label(*bitrate_kbps == Some(b), format!("{b}k")).clicked() {
-                        *bitrate_kbps = Some(b);
+                if ui.selectable_label(*bitrate == Bitrate::Default, "default").clicked() {
+                    *bitrate = Bitrate::Default;
+                }
+                for b in BITRATE_LADDER {
+                    if ui.selectable_label(*bitrate == Bitrate::Fixed(b), format!("{b}k")).clicked() {
+                        *bitrate = Bitrate::Fixed(b);
                     }
                 }
             });
@@ -378,13 +392,13 @@ fn set_codec(stream: &mut OutStream, codec: &str) {
         stream.encode = Encode::Copy;
         return;
     }
-    let (bitrate_kbps, channels) = match &stream.encode {
-        Encode::Audio { bitrate_kbps, channels, .. } => (*bitrate_kbps, *channels),
-        Encode::Copy => (Some(192), None),
+    let (bitrate, channels) = match &stream.encode {
+        Encode::Audio { bitrate, channels, .. } => (bitrate.clone(), *channels),
+        Encode::Copy => (Bitrate::Fixed(192), None),
     };
     stream.encode = Encode::Audio {
         codec: codec.to_string(),
-        bitrate_kbps,
+        bitrate,
         channels,
     };
 }

@@ -590,7 +590,7 @@ mod tests {
     fn demo_project() -> Project {
         let mk = |input, index, kind, codec: &str, meta| {
             OutStream::new(
-                Source { input, index, kind, codec: codec.into() },
+                Source { input, index, kind, codec: codec.into(), bitrate_kbps: None },
                 meta,
                 Encode::Copy,
             )
@@ -678,7 +678,7 @@ mod tests {
                 offset_secs: -0.2,
             });
             let mut embedded = OutStream::new(
-                Source { input: 1, index: 0, kind: Kind::Subtitle, codec: "subrip".into() },
+                Source { input: 1, index: 0, kind: Kind::Subtitle, codec: "subrip".into(), bitrate_kbps: None },
                 Meta { language: Some("eng".into()), ..Default::default() },
                 Encode::Copy,
             );
@@ -706,7 +706,7 @@ mod tests {
                 offset_secs: 0.15,
             });
             let mut embedded = OutStream::new(
-                Source { input: 1, index: 0, kind: Kind::Audio, codec: "flac".into() },
+                Source { input: 1, index: 0, kind: Kind::Audio, codec: "flac".into(), bitrate_kbps: None },
                 Meta::default(),
                 Encode::Copy,
             );
@@ -769,7 +769,7 @@ mod tests {
         let mut app = app_with_demo();
         // Append an attachment and select it; extracting it isn't supported.
         let attach = OutStream::new(
-            Source { input: 0, index: 9, kind: Kind::Attachment, codec: "ttf".into() },
+            Source { input: 0, index: 9, kind: Kind::Attachment, codec: "ttf".into(), bitrate_kbps: None },
             Meta::default(),
             Encode::Copy,
         );
