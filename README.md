@@ -1,7 +1,7 @@
 # Interlace
 
-A focused native desktop app for **remuxing** media — reordering, tagging,
-removing, extracting, inserting, and converting the streams inside a video file —
+A focused native desktop app for **remuxing** media -- reordering, tagging,
+removing, extracting, inserting, and converting the streams inside a video file --
 built as a friendly GUI over `ffmpeg` / `ffprobe`.
 
 Five of its six operations are lossless container edits (`-c copy`): they rewrap
@@ -11,25 +11,25 @@ your streams in seconds without re-encoding. Only audio conversion re-encodes.
 
 ## What it does
 
-- **Reorder** streams by dragging rows into the output order you want.
-- **Tag** language, title, and `default` / `forced` flags per stream — plus a
-  title for the whole output file.
-- **Remove** streams you don't want.
+- **Reorder** streams by dragging rows into the output order you want;
+- **Tag** language, title, and `default`/`forced` flags per stream -- plus a
+  title for the whole output file;
+- **Remove** streams you don't want;
 - **Extract** a single stream to its own file (`.aac`, `.srt`, …), picking the
-  right container automatically.
+  right container automatically;
 - **Insert** an external audio or subtitle track from another file, with a
-  per-track sync offset to line it up against the video.
-- **Convert** audio to AAC / AC-3 / Opus / FLAC / MP3 with bitrate and channel
+  per-track sync offset to line it up against the video;
+- **Convert** audio to AAC/AC3/Opus/FLAC/MP3 with bitrate and channel
   control.
 
-The assembled ffmpeg command is always visible at the bottom, and **editable** —
+The assembled ffmpeg command is always visible at the bottom, and **editable** --
 tweak it and hit Run to execute your own command verbatim. Before a run, Interlace
 flags common container/codec mismatches (e.g. an ASS subtitle bound for an MP4)
 with a suggestion.
 
 ## Requirements
 
-Interlace calls `ffmpeg` and `ffprobe` — it does **not** bundle them.
+Interlace calls `ffmpeg` and `ffprobe` -- it does **not** bundle them.
 
 - Install a recent ffmpeg build and put `ffmpeg` / `ffprobe` on your `PATH`, or
 - Open the **⚙** panel in the app and point it at your binaries directly.
@@ -67,4 +67,3 @@ scripts\package.ps1          # build a release .zip in dist\
 ## Notes
 
 - Windows-first; the code is portable but only packaged/tested on Windows so far.
-- Licensing is not yet decided — add a `LICENSE` file before distributing.
