@@ -32,9 +32,11 @@ fn main() -> eframe::Result {
     // GUI: optionally preload the first non-flag argument as a file.
     let initial = argv.iter().find(|a| !a.starts_with("--")).map(PathBuf::from);
 
+    // The startup size doubles as the minimum: the layout is tuned for it, so
+    // shrinking below it just clips the stream table and inspector.
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([780.0, 720.0])
-        .with_min_inner_size([560.0, 480.0])
+        .with_inner_size([790.0, 720.0])
+        .with_min_inner_size([790.0, 720.0])
         .with_title("interlace");
     // Window/taskbar icon. Embedded at compile time; ignored if it won't decode.
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
