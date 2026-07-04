@@ -96,18 +96,25 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
 
         // Editing fields disable while the stream is marked for removal.
         let editable = !stream.removed;
+        // Video has no spoken language, and `forced` is a subtitle concept (foreign
+        // dialogue/signs) that no player acts on for a video track — so both fields
+        // are hidden for video. The underlying `Meta` still carries any probed tags,
+        // which pass through untouched on copy; we just don't offer to edit them.
+        let is_video = kind == Kind::Video;
         ui.add_enabled_ui(editable, |ui| {
-            field(ui, "language", |ui| {
-                let mut lang = stream.meta.language.clone().unwrap_or_default();
-                if ui
-                    .add(egui::TextEdit::singleline(&mut lang).desired_width(84.0))
-                    .changed()
-                {
-                    let lang = lang.trim().to_string();
-                    stream.meta.language = (!lang.is_empty()).then_some(lang);
-                }
-            });
-            ui.add_space(4.0);
+            if !is_video {
+                field(ui, "language", |ui| {
+                    let mut lang = stream.meta.language.clone().unwrap_or_default();
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut lang).desired_width(84.0))
+                        .changed()
+                    {
+                        let lang = lang.trim().to_string();
+                        stream.meta.language = (!lang.is_empty()).then_some(lang);
+                    }
+                });
+                ui.add_space(4.0);
+            }
             field(ui, "title", |ui| {
                 let mut title = stream.meta.title.clone().unwrap_or_default();
                 if ui
@@ -121,7 +128,9 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.checkbox(&mut stream.meta.default, "default");
-                ui.checkbox(&mut stream.meta.forced, "forced");
+                if !is_video {
+                    ui.checkbox(&mut stream.meta.forced, "forced");
+                }
             });
         });
 

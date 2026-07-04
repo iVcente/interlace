@@ -30,6 +30,27 @@ fn output_takes_stream_tags(output: &Path) -> bool {
     )
 }
 
+/// Emit a `-metadata:s:<spec> key=value` pair for a per-stream tag, matching the
+/// output to the edited value:
+/// - `Some(v)` → set the tag to `v`, overriding the source's passthrough value.
+/// - `None` but the source *had* one (`orig` is `Some`) → emit an empty `key=`,
+///   which ffmpeg treats as a deletion. Without this the original tag would copy
+///   straight through, so an emptied field would appear to do nothing.
+/// - `None` and the source had none → emit nothing.
+fn push_tag(a: &mut Vec<String>, spec: &str, key: &str, cur: &Option<String>, orig: &Option<String>) {
+    match cur {
+        Some(v) => {
+            a.push(format!("-metadata:s:{spec}"));
+            a.push(format!("{key}={v}"));
+        }
+        None if orig.is_some() => {
+            a.push(format!("-metadata:s:{spec}"));
+            a.push(format!("{key}="));
+        }
+        None => {}
+    }
+}
+
 impl Project {
     /// Render this project as the argument vector for `ffmpeg` (the program name
     /// itself is not included). Passed straight to `std::process::Command`, so no
@@ -119,16 +140,10 @@ impl Project {
                 continue;
             }
 
-            // Metadata. `None` emits nothing, so the original tag passes through
-            // the copy untouched.
-            if let Some(l) = &s.meta.language {
-                a.push(format!("-metadata:s:{spec}"));
-                a.push(format!("language={l}"));
-            }
-            if let Some(t) = &s.meta.title {
-                a.push(format!("-metadata:s:{spec}"));
-                a.push(format!("title={t}"));
-            }
+            // Metadata. A set value overrides the source; emptying a tag the
+            // source *had* emits an explicit clear (see `push_tag`).
+            push_tag(&mut a, &spec, "language", &s.meta.language, &s.orig_meta.language);
+            push_tag(&mut a, &spec, "title", &s.meta.title, &s.orig_meta.title);
 
             // Always emit disposition — even when empty (`0`) — so reordering can
             // never strand a stale `default`/`forced` flag on the wrong stream.
@@ -377,6 +392,35 @@ mod tests {
             joined.contains("-disposition:a:1 default+forced"),
             "flags ride along to a:1: {joined}"
         );
+    }
+
+    /// Emptying a tag the source *had* emits an explicit clear (`title=`) so the
+    /// original doesn't pass through the copy; a tag set to a value overrides; a
+    /// field that was empty to begin with emits nothing.
+    #[test]
+    fn emptied_tag_emits_explicit_clear() {
+        // Probed with a title + language, then the user cleared both in the editor.
+        let mut cleared = keep(
+            src(0, 1, Kind::Audio, "aac"),
+            Meta {
+                title: Some("Commentary".into()),
+                language: Some("eng".into()),
+                ..Default::default()
+            },
+        );
+        cleared.meta.title = None;
+        cleared.meta.language = None;
+
+        // Probed with no title; still has none — nothing to clear.
+        let untouched = keep(src(0, 2, Kind::Audio, "aac"), Meta::default());
+
+        let joined = project(&["in.mkv"], vec![cleared, untouched]).to_args().join(" ");
+
+        // a:0 gets an explicit empty assignment for each previously-present tag.
+        assert!(joined.contains("-metadata:s:a:0 title="), "clears title: {joined}");
+        assert!(joined.contains("-metadata:s:a:0 language="), "clears language: {joined}");
+        // a:1 never had either, so no metadata is emitted for it at all.
+        assert!(!joined.contains("-metadata:s:a:1"), "no spurious clear: {joined}");
     }
 
     /// A raw/elementary output (extraction target) emits only `-map` + `-c copy`:

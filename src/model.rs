@@ -166,10 +166,10 @@ impl Encode {
 
 /// User-editable tags and flags for a stream.
 ///
-/// `language`/`title` are `Option`: `None` means "emit nothing", which lets the
-/// original tag pass through the copy unchanged. (Actively *clearing* an
-/// existing tag needs a different representation; that's an editing-milestone
-/// concern, noted in the plan.)
+/// `language`/`title` are `Option`. `Some` sets the tag; `None` means "no tag in
+/// the output". Emptying a field the source *had* is honored as an active clear —
+/// `args.rs` diffs against `orig_meta` and emits an empty `key=` so the original
+/// doesn't pass through the copy (see `push_tag`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Meta {
     /// ISO 639-2, e.g. "jpn".
