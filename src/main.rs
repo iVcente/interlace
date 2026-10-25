@@ -37,7 +37,9 @@ fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([790.0, 720.0])
         .with_min_inner_size([790.0, 720.0])
-        .with_title("interlace");
+        .with_title("interlace")
+        // Files can be dropped onto the window to open them or embed tracks.
+        .with_drag_and_drop(true);
     // Window/taskbar icon. Embedded at compile time; ignored if it won't decode.
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(icon);

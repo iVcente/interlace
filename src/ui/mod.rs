@@ -12,6 +12,10 @@
 //! The table selection is a set (`selection::Selection`), so the inspector and
 //! the remove/restore/convert mutations below work over every selected row at
 //! once. Single-stream-only actions (extract, sync offset) need exactly one.
+//!
+//! Media enters through the sources-bar pickers or by dropping files onto the
+//! window. Drops reuse the picker paths (`load_file` / `embed_file`), routed by
+//! extension against the same `TRACK_EXTENSIONS` list the track picker filters on.
 
 mod command;
 mod inspector;
@@ -143,6 +147,35 @@ impl InterlaceApp {
             }
             Err(e) => self.error = Some(e),
         }
+    }
+
+    /// Handle files dropped onto the window, routing each through the same path
+    /// as the pickers: a container opens via `load_file`, a track embeds via
+    /// `embed_file` (which itself opens it when no project is loaded yet). Each
+    /// call's error is collected as we go — otherwise a later success clearing
+    /// `error` would hide an earlier failure.
+    pub(crate) fn open_dropped(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        if matches!(self.run_state, RunState::Running { .. }) {
+            self.error = Some("Can't change sources while a run is in progress.".into());
+            return;
+        }
+        let (ordered, skipped) = order_drops(paths);
+        let mut errors = Vec::new();
+        for path in ordered {
+            if is_track_file(&path) {
+                self.embed_file(path);
+            } else {
+                self.load_file(path);
+            }
+            errors.extend(self.error.take());
+        }
+        for path in skipped {
+            errors.push(format!("{} skipped — only one file can be opened at a time.", path.display()));
+        }
+        self.error = (!errors.is_empty()).then(|| errors.join("\n"));
     }
 
     // --- model mutations (called by the table/inspector after rendering) -----
@@ -320,6 +353,18 @@ impl InterlaceApp {
     fn render(&mut self, ui: &mut egui::Ui) {
         self.poll_run(ui.ctx());
 
+        // Files dropped onto the window this frame. Entries without a path (web
+        // drops carrying only bytes) and folders have nothing for ffprobe to read.
+        let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .filter(|p| !p.is_dir())
+                .collect()
+        });
+        self.open_dropped(dropped);
+
         // Toggling a panel on/off doesn't trigger egui's automatic settle-pass
         // (unlike changing central content), so the first frame after a toggle is
         // laid out unsettled and paints a flash of red id-clash outlines. Force a
@@ -386,6 +431,33 @@ impl InterlaceApp {
         });
 
         self.overwrite_modal(ui.ctx());
+        self.drop_overlay(ui.ctx());
+    }
+
+    /// While files are dragged over the window, dim it and say what a drop will
+    /// do — otherwise there's no cue that the window accepts drops at all.
+    fn drop_overlay(&self, ctx: &egui::Context) {
+        if ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            return;
+        }
+        let text = if self.project.is_some() {
+            "drop to open file or add track"
+        } else {
+            "drop to open"
+        };
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("drop_overlay"),
+        ));
+        let screen = ctx.content_rect();
+        painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(180));
+        painter.text(
+            screen.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::proportional(22.0),
+            egui::Color32::WHITE,
+        );
     }
 
     fn overwrite_modal(&mut self, ctx: &egui::Context) {
@@ -608,18 +680,43 @@ pub(super) fn pick_media_file() -> Option<PathBuf> {
         .pick_file()
 }
 
+/// Extensions treated as a single external track rather than a container. Shared
+/// by the "add track" picker filter and drag-and-drop routing, so what the picker
+/// offers and what a drop embeds can't drift apart.
+const TRACK_EXTENSIONS: &[&str] = &[
+    "srt", "ass", "ssa", "vtt", "sup", "sub", // subtitles
+    "flac", "aac", "ac3", "eac3", "dts", "mp3", "opus", "ogg", "wav", "m4a", "thd",
+    "mka", // audio
+];
+
+/// Whether `path` looks like an embeddable track (by extension, case-insensitive).
+/// Anything else — including a file with no extension — is treated as a container.
+fn is_track_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| TRACK_EXTENSIONS.iter().any(|t| t.eq_ignore_ascii_case(e)))
+}
+
+/// Order a multi-file drop for processing: the first container (if any) first, so
+/// the tracks have a project to embed into, then every track in drop order.
+/// Further containers come back as `skipped` — only one file can be the project,
+/// and loading a second would silently replace the first.
+fn order_drops(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let (tracks, mut containers): (Vec<PathBuf>, Vec<PathBuf>) =
+        paths.into_iter().partition(|p| is_track_file(p));
+    let mut ordered = Vec::with_capacity(tracks.len() + 1);
+    if !containers.is_empty() {
+        ordered.push(containers.remove(0));
+    }
+    ordered.extend(tracks);
+    (ordered, containers)
+}
+
 /// Open a native file picker for an embeddable track. Filtered to audio and
 /// subtitle files only — you embed one external track, not another container.
 pub(super) fn pick_track_file() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .add_filter(
-            "Audio or subtitle",
-            &[
-                "srt", "ass", "ssa", "vtt", "sup", "sub", // subtitles
-                "flac", "aac", "ac3", "eac3", "dts", "mp3", "opus", "ogg", "wav", "m4a", "thd",
-                "mka", // audio
-            ],
-        )
+        .add_filter("Audio or subtitle", TRACK_EXTENSIONS)
         .pick_file()
 }
 
@@ -974,6 +1071,54 @@ mod tests {
         assert_eq!(p.streams[2].source.index, 1);
         assert_eq!(p.streams[4].source.index, 2);
         assert_eq!(app.selection.to_vec(), [2, 4], "the new siblings are selected");
+    }
+
+    #[test]
+    fn is_track_file_matches_track_extensions_case_insensitively() {
+        assert!(is_track_file(Path::new("subs.SRT")));
+        assert!(is_track_file(Path::new(r"C:\media\commentary.flac")));
+        assert!(!is_track_file(Path::new("movie.mkv")));
+        assert!(!is_track_file(Path::new("clip.mp4")));
+        assert!(!is_track_file(Path::new("no_extension")));
+    }
+
+    /// The container goes first so the tracks have something to embed into;
+    /// extra containers are skipped rather than replacing the first.
+    #[test]
+    fn order_drops_puts_first_container_first_and_skips_the_rest() {
+        let paths = ["eng.srt", "movie.mkv", "other.mkv", "c.flac"].map(PathBuf::from).to_vec();
+        let (ordered, skipped) = order_drops(paths);
+        assert_eq!(ordered, ["movie.mkv", "eng.srt", "c.flac"].map(PathBuf::from));
+        assert_eq!(skipped, [PathBuf::from("other.mkv")]);
+
+        // Tracks only: drop order is kept, nothing skipped.
+        let (ordered, skipped) = order_drops(["b.ass", "a.aac"].map(PathBuf::from).to_vec());
+        assert_eq!(ordered, ["b.ass", "a.aac"].map(PathBuf::from));
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn open_dropped_empty_is_a_noop() {
+        let mut app = app_with_demo();
+        app.error = Some("earlier".into());
+        app.open_dropped(Vec::new());
+        assert_eq!(app.error.as_deref(), Some("earlier"));
+        assert_eq!(app.project.as_ref().unwrap().streams.len(), 3);
+    }
+
+    /// Hovering files shows the drop overlay, with or without a project loaded.
+    #[test]
+    fn renders_drop_overlay_while_hovering_files() {
+        let input = || egui::RawInput {
+            hovered_files: vec![egui::HoveredFile {
+                path: Some(PathBuf::from("movie.mkv")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(input(), |ui| app_with_demo().render(ui));
+        let _ = ctx.run_ui(input(), |ui| InterlaceApp::empty().render(ui));
     }
 
     #[test]

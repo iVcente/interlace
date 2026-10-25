@@ -40,7 +40,7 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
 
         let Some(project) = &app.project else {
             ui.add_space(6.0);
-            ui.weak("Load a media file to see its streams.");
+            ui.weak("Load or drop a media file to see its streams.");
             ui.add_space(6.0);
             return;
         };

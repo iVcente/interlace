@@ -6,7 +6,9 @@
 //! "+ add file" opens a picker and loads it as the primary project (replacing any
 //! current one). "+ add track" — shown only once a file is loaded — appends an
 //! external audio or subtitle file as an additional input, embedding its single
-//! track into the current project (see `InterlaceApp::embed_file`).
+//! track into the current project (see `InterlaceApp::embed_file`). Files can
+//! also be dropped onto the window, which takes the same two paths
+//! (`InterlaceApp::open_dropped`).
 
 use super::{InterlaceApp, RunState, card, pick_media_file, pick_track_file};
 
