@@ -8,13 +8,19 @@
 //! `InterlaceApp` owns the whole session state; each screen region lives in its
 //! own submodule (`sources`, `table`, `inspector`, `command`) and is handed
 //! `&mut InterlaceApp` to render. Shared drawing helpers live here.
+//!
+//! The table selection is a set (`selection::Selection`), so the inspector and
+//! the remove/restore/convert mutations below work over every selected row at
+//! once. Single-stream-only actions (extract, sync offset) need exactly one.
 
 mod command;
 mod inspector;
+mod selection;
 mod sources;
 mod table;
 
 use crate::model::{Encode, Kind, OutStream, Project};
+use selection::Selection;
 use crate::run::{self, RunUpdate};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -37,8 +43,8 @@ pub(crate) enum RunState {
 pub struct InterlaceApp {
     /// The current editing session; `None` until a file is loaded.
     pub(crate) project: Option<Project>,
-    /// Index into `project.streams` of the selected row, if any.
-    pub(crate) selected: Option<usize>,
+    /// The selected rows of the stream table (indices into `project.streams`).
+    pub(crate) selection: Selection,
     /// Last error to surface (probe failure, etc.).
     pub(crate) error: Option<String>,
     pub(crate) run_state: RunState,
@@ -76,7 +82,7 @@ impl InterlaceApp {
     fn empty() -> Self {
         Self {
             project: None,
-            selected: None,
+            selection: Selection::default(),
             error: None,
             run_state: RunState::Idle,
             pending_run: None,
@@ -107,7 +113,10 @@ impl InterlaceApp {
     pub fn load_file(&mut self, path: PathBuf) {
         match Project::from_input(&self.ffprobe, &path) {
             Ok(project) => {
-                self.selected = (!project.streams.is_empty()).then_some(0);
+                self.selection.clear();
+                if !project.streams.is_empty() {
+                    self.selection.set_single(0);
+                }
                 self.project = Some(project);
                 self.error = None;
                 self.run_state = RunState::Idle;
@@ -129,7 +138,7 @@ impl InterlaceApp {
         };
         match project.append_input(&self.ffprobe, &path) {
             Ok(i) => {
-                self.selected = Some(i);
+                self.selection.set_single(i);
                 self.error = None;
             }
             Err(e) => self.error = Some(e),
@@ -138,46 +147,69 @@ impl InterlaceApp {
 
     // --- model mutations (called by the table/inspector after rendering) -----
 
-    /// Add a re-encoded sibling of `streams[i]`: the same source, a default AAC
-    /// conversion, inserted right after the original (which stays a stream-copy)
-    /// and selected — so its codec, tags, and order are tuned like any stream.
-    pub(crate) fn add_converted_stream(&mut self, i: usize) {
+    /// Add a re-encoded sibling of each stream in `rows`: the same source, a
+    /// default AAC conversion, inserted right after its original (which stays a
+    /// stream-copy). The new siblings become the selection, so their codec, tags,
+    /// and order are tuned next like any stream. `rows` must be ascending.
+    pub(crate) fn add_converted_streams(&mut self, rows: &[usize]) {
         let Some(p) = &mut self.project else { return };
-        let Some(orig) = p.streams.get(i) else { return };
-        // Seed the copy's tags from the original, but clear default/forced so we
-        // don't emit two "default" streams for the same track.
-        let mut meta = orig.meta.clone();
-        meta.default = false;
-        meta.forced = false;
-        let mut converted = OutStream::new(orig.source.clone(), meta, Encode::default_audio());
-        converted.added = true; // synthetic — deleted outright, not soft-removed
-        let at = (i + 1).min(p.streams.len());
-        p.streams.insert(at, converted);
-        self.selected = Some(at);
-    }
-
-    /// Hard-remove `streams[i]` from the project, fixing the selection to a
-    /// surviving stream. Used for synthetic (`added`) streams, which aren't in
-    /// the source file so there's nothing to preview as a "soft" removal.
-    pub(crate) fn delete_stream(&mut self, i: usize) {
-        let Some(p) = &mut self.project else { return };
-        if i >= p.streams.len() {
-            return;
+        let rows: Vec<usize> = rows.iter().copied().filter(|&i| i < p.streams.len()).collect();
+        // Insert from the highest index down so each insert leaves the lower,
+        // not-yet-visited originals where they are.
+        for &i in rows.iter().rev() {
+            let orig = &p.streams[i];
+            // Seed the copy's tags from the original, but clear default/forced so
+            // we don't emit two "default" streams for the same track.
+            let mut meta = orig.meta.clone();
+            meta.default = false;
+            meta.forced = false;
+            let mut converted = OutStream::new(orig.source.clone(), meta, Encode::default_audio());
+            converted.added = true; // synthetic — deleted outright, not soft-removed
+            p.streams.insert(i + 1, converted);
         }
-        p.streams.remove(i);
-        // Dropping the last stream of an embedded track also drops its `-i`.
-        p.prune_orphan_inputs();
-        let len = p.streams.len();
-        self.selected = match self.selected {
-            _ if len == 0 => None,
-            Some(s) if s > i => Some(s - 1),
-            Some(s) if s == i => Some(i.min(len - 1)),
-            other => other, // s < i, or None
-        };
+        // The k-th original (ascending) ends up shifted by the k siblings inserted
+        // before it, so its sibling sits at `i + 1 + k`.
+        self.selection
+            .set_many(rows.iter().enumerate().map(|(k, &i)| i + 1 + k));
     }
 
-    /// Move the stream at `from` to insertion index `to` (0..=len), keeping the
-    /// moved stream selected. `to` is expressed in the pre-removal coordinate
+    /// Remove every selected stream: originals are soft-removed (dimmed, kept for
+    /// Restore), synthetic `added` ones are deleted outright — the same thing the
+    /// inspector's remove button does for each on its own. Driven by that button
+    /// and the Delete key.
+    pub(crate) fn remove_selected(&mut self) {
+        let Some(p) = &mut self.project else { return };
+        let mut deleted = false;
+        // Walk high→low so a hard delete only shifts rows we've already handled.
+        for i in self.selection.to_vec().into_iter().rev() {
+            let Some(stream) = p.streams.get_mut(i) else { continue };
+            if stream.added {
+                p.streams.remove(i);
+                self.selection.on_removed(i, p.streams.len());
+                deleted = true;
+            } else {
+                stream.removed = true;
+            }
+        }
+        if deleted {
+            // Dropping the last stream of an embedded track also drops its `-i`.
+            p.prune_orphan_inputs();
+        }
+    }
+
+    /// Undo a soft removal on every selected stream.
+    pub(crate) fn restore_selected(&mut self) {
+        let Some(p) = &mut self.project else { return };
+        for i in self.selection.iter() {
+            if let Some(stream) = p.streams.get_mut(i) {
+                stream.removed = false;
+            }
+        }
+    }
+
+    /// Move the stream at `from` to insertion index `to` (0..=len). The selection
+    /// collapses to the moved stream: a drag moves one row, so that row is what
+    /// the user is focused on. `to` is expressed in the pre-removal coordinate
     /// space, as computed from the drop pointer position.
     pub(crate) fn reorder(&mut self, from: usize, to: usize) {
         let Some(p) = &mut self.project else { return };
@@ -188,7 +220,7 @@ impl InterlaceApp {
         let insert = if from < to { to - 1 } else { to };
         let insert = insert.min(p.streams.len());
         p.streams.insert(insert, item);
-        self.selected = Some(insert);
+        self.selection.set_single(insert);
     }
 
     // --- running -------------------------------------------------------------
@@ -209,8 +241,9 @@ impl InterlaceApp {
     }
 
     /// Extract the selected stream to its own file, running it as a one-off job.
+    /// Needs exactly one selected stream; a batch extract would need a run queue.
     pub(crate) fn extract_selected(&mut self) {
-        let Some(idx) = self.selected else { return };
+        let Some(idx) = self.selection.single() else { return };
         let Some(project) = &self.project else { return };
         match project.extract(idx) {
             Some(extract) => {
@@ -627,7 +660,7 @@ mod tests {
     fn app_with_demo() -> InterlaceApp {
         let mut app = InterlaceApp::empty();
         app.project = Some(demo_project());
-        app.selected = Some(1);
+        app.selection.set_single(1);
         app
     }
 
@@ -649,7 +682,7 @@ mod tests {
     #[test]
     fn add_converted_stream_keeps_original_and_inserts_sibling() {
         let mut app = app_with_demo(); // selected = 1 (the flac audio, default+jpn)
-        app.add_converted_stream(1);
+        app.add_converted_streams(&[1]);
         let p = app.project.as_ref().unwrap();
 
         assert_eq!(p.streams.len(), 4);
@@ -662,7 +695,7 @@ mod tests {
         assert_eq!(p.streams[2].source.index, 1);
         assert_eq!(p.streams[2].meta.language.as_deref(), Some("jpn"));
         assert!(!p.streams[2].meta.default);
-        assert_eq!(app.selected, Some(2));
+        assert_eq!(app.selection.single(), Some(2));
 
         // Both map from the same input stream → the source is emitted twice.
         let maps: Vec<String> = p
@@ -695,8 +728,8 @@ mod tests {
             p.streams.push(embedded);
         }
         let last = app.project.as_ref().unwrap().streams.len() - 1;
-        app.selected = Some(last);
-        app.delete_stream(last);
+        app.selection.set_single(last);
+        app.remove_selected();
 
         let p = app.project.as_ref().unwrap();
         assert_eq!(p.inputs.len(), 1, "orphan input pruned");
@@ -722,7 +755,7 @@ mod tests {
             embedded.added = true;
             p.streams.push(embedded);
         }
-        app.selected = Some(app.project.as_ref().unwrap().streams.len() - 1);
+        app.selection.set_single(app.project.as_ref().unwrap().streams.len() - 1);
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
@@ -730,9 +763,9 @@ mod tests {
     #[test]
     fn delete_stream_hard_removes_added_sibling() {
         let mut app = app_with_demo(); // 3 streams, selected = 1
-        app.add_converted_stream(1); // now 4 streams, added sibling selected at 2
+        app.add_converted_streams(&[1]); // now 4 streams, added sibling selected at 2
         assert!(app.project.as_ref().unwrap().streams[2].added);
-        app.delete_stream(2); // hard delete the synthetic stream
+        app.remove_selected(); // hard delete the synthetic stream
         let p = app.project.as_ref().unwrap();
         assert_eq!(p.streams.len(), 3); // back to the original three
         assert!(!p.streams.iter().any(|s| s.added));
@@ -745,7 +778,7 @@ mod tests {
         app.reorder(2, 0);
         let streams = &app.project.as_ref().unwrap().streams;
         assert_eq!(streams[0].source.kind, Kind::Subtitle);
-        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.selection.single(), Some(0));
     }
 
     #[test]
@@ -783,7 +816,7 @@ mod tests {
             Encode::Copy,
         );
         app.project.as_mut().unwrap().streams.push(attach);
-        app.selected = Some(app.project.as_ref().unwrap().streams.len() - 1);
+        app.selection.set_single(app.project.as_ref().unwrap().streams.len() - 1);
         app.extract_selected();
         assert!(app.error.is_some());
     }
@@ -869,6 +902,102 @@ mod tests {
         let mut app = app_with_demo();
         app.show_command = false;
         let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
+    }
+
+    /// Push an embedded subtitle (input 1, `added`) onto the demo project and
+    /// return its row index.
+    fn push_embedded_sub(app: &mut InterlaceApp) -> usize {
+        let p = app.project.as_mut().unwrap();
+        p.inputs.push(Input::new(PathBuf::from("subs.srt")));
+        let mut embedded = OutStream::new(
+            Source { input: 1, index: 0, kind: Kind::Subtitle, codec: "subrip".into(), bitrate_kbps: None },
+            Meta::default(),
+            Encode::Copy,
+        );
+        embedded.added = true;
+        p.streams.push(embedded);
+        p.streams.len() - 1
+    }
+
+    /// Removing a mixed selection soft-removes the originals, hard-deletes the
+    /// synthetic stream (pruning its now-orphan input), and Restore undoes the rest.
+    #[test]
+    fn remove_selected_soft_removes_originals_and_deletes_added() {
+        let mut app = app_with_demo();
+        let embedded = push_embedded_sub(&mut app); // row 3
+        app.selection.set_many([1, 2, embedded]);
+        app.remove_selected();
+
+        let p = app.project.as_ref().unwrap();
+        assert_eq!(p.streams.len(), 3, "embedded stream deleted outright");
+        assert_eq!(p.inputs.len(), 1, "its orphan input pruned");
+        assert!(p.streams[1].removed && p.streams[2].removed);
+        assert!(!p.streams[0].removed);
+        assert_eq!(app.selection.to_vec(), [1, 2]);
+
+        app.restore_selected();
+        assert!(app.project.as_ref().unwrap().streams.iter().all(|s| !s.removed));
+    }
+
+    /// The Delete key goes through the same path as the remove button.
+    #[test]
+    fn delete_key_removes_selection() {
+        let mut app = app_with_demo();
+        app.selection.set_many([0, 2]);
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Delete,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| app.render(ui));
+        let removed: Vec<bool> = app.project.as_ref().unwrap().streams.iter().map(|s| s.removed).collect();
+        assert_eq!(removed, [true, false, true]);
+    }
+
+    #[test]
+    fn add_converted_streams_inserts_a_sibling_after_each() {
+        let mut app = app_with_demo();
+        // Make row 2 audio too so both selected rows are convertible.
+        app.project.as_mut().unwrap().streams[2].source.kind = Kind::Audio;
+        app.add_converted_streams(&[1, 2]);
+
+        let p = app.project.as_ref().unwrap();
+        let added: Vec<bool> = p.streams.iter().map(|s| s.added).collect();
+        assert_eq!(added, [false, false, true, false, true]);
+        assert_eq!(p.streams[2].source.index, 1);
+        assert_eq!(p.streams[4].source.index, 2);
+        assert_eq!(app.selection.to_vec(), [2, 4], "the new siblings are selected");
+    }
+
+    #[test]
+    fn reorder_collapses_multi_selection_to_moved_row() {
+        let mut app = app_with_demo();
+        app.selection.select_all(3);
+        app.reorder(0, 3); // video to the bottom
+        assert_eq!(app.selection.single(), Some(2));
+    }
+
+    /// A mixed-kind multi-selection renders the batch inspector (mixed tags,
+    /// indeterminate flags, extract disabled) without panicking.
+    #[test]
+    fn renders_mixed_multi_selection() {
+        let mut app = app_with_demo();
+        app.selection.select_all(3);
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
+
+        // And an all-audio selection that is partly converting, which shows the
+        // mixed conversion controls.
+        let mut app = app_with_demo();
+        app.add_converted_streams(&[1]);
+        app.selection.set_many([1, 2]);
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
 }

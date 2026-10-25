@@ -3,7 +3,9 @@
 //!
 //! Rows are drag-to-reorder (via egui's built-in `dnd_drag_source` /
 //! `dnd_drop_zone` — only the handle initiates a drag, so the row body stays
-//! clickable for selection). Editing happens in the side-panel inspector; this
+//! clickable for selection). Row clicks are multi-select: Ctrl toggles a row,
+//! Shift selects a range (see `selection.rs`); Ctrl+A / Esc / Delete select all,
+//! clear, and remove the selection. Editing happens in the side-panel inspector; this
 //! table only *shows* state, so the ACTION column is now a set of read-only
 //! badges describing how each row differs from the original (`convert`, `retag`,
 //! `flags`, or a red `remove` for a stream marked for removal).
@@ -26,7 +28,9 @@ const C_EMBED: egui::Color32 = egui::Color32::from_rgb(46, 160, 90); // green
 const C_OFFSET: egui::Color32 = egui::Color32::from_rgb(13, 148, 136); // teal
 
 pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
-    let selected = app.selected;
+    shortcuts(ui, app);
+
+    let selection = &app.selection;
     let mut click: Option<usize> = None;
     let mut reorder: Option<(usize, usize)> = None;
 
@@ -48,7 +52,7 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
                 // Every stream references a valid input (the model invariant), so
                 // its source input is always present.
                 let input = &project.inputs[stream.source.input];
-                let rect = stream_row(ui, stream, input, i, selected == Some(i), &mut click);
+                let rect = stream_row(ui, stream, input, i, selection.contains(i), &mut click);
                 rects.push(rect);
             }
         });
@@ -69,10 +73,41 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
 
     // Apply mutations after the immutable borrow of `app.project` ends.
     if let Some(i) = click {
-        app.selected = Some(i);
+        let modifiers = ui.input(|input| input.modifiers);
+        let len = app.project.as_ref().map_or(0, |p| p.streams.len());
+        app.selection.click(i, modifiers, len);
     }
     if let Some((from, to)) = reorder {
         app.reorder(from, to);
+    }
+}
+
+/// Table-wide keyboard shortcuts: Ctrl+A selects every stream, Esc clears the
+/// selection, Delete removes it. Skipped while a text field has focus, so typing
+/// a title or editing the command bar (where these keys mean text editing) is
+/// never hijacked — and while a combo popup or the overwrite modal is up, where
+/// Esc means "close this", not "deselect".
+fn shortcuts(ui: &egui::Ui, app: &mut InterlaceApp) {
+    let Some(len) = app.project.as_ref().map(|p| p.streams.len()) else { return };
+    let ctx = ui.ctx();
+    if ctx.egui_wants_keyboard_input() || egui::Popup::is_any_open(ctx) || app.pending_run.is_some() {
+        return;
+    }
+    let (all, clear, remove) = ui.input_mut(|i| {
+        (
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
+        )
+    });
+    if all {
+        app.selection.select_all(len);
+    }
+    if clear {
+        app.selection.clear();
+    }
+    if remove {
+        app.remove_selected();
     }
 }
 

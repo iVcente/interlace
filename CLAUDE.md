@@ -46,6 +46,7 @@ The pipeline:
 
 UI (`src/ui/`): `InterlaceApp` in `ui/mod.rs` owns all session state. Each screen region is a submodule (`sources`, `table`, `inspector`, `command`) and receives `&mut InterlaceApp` to draw itself. `poll_run` drains the run channel every frame and calls `request_repaint` while a run is active.
 
+- Selection: `app.selection` (`ui/selection.rs`) is a set of row indices plus a Shift-click anchor. The inspector edits every selected stream at once and shows a "mixed" state where they differ. Extract and sync offset need exactly one stream (`selection.single()`). Any mutation that shifts `streams` must fix up the selection (`on_removed`, `set_single`, `set_many`).
 - Command-bar escape hatch: while `command_edit` is `None`, the bar mirrors `to_args()` live. Once the user edits it, it becomes `Some(text)`. Run then tokenizes that text (`run::tokenize`), drops a leading `ffmpeg` token (the configured binary takes precedence) and runs it verbatim. Validation hints are hidden in this state. Loading a file or pressing Reset sets it back to `None`.
 - The trait method passes the root `Ui` to `render(&mut self, ui)`, which is kept separate so tests can drive it. eframe 0.35's `App::ui` takes a root `Ui`, and panels are shown *into* a `Ui`.
 - When the command panel is toggled, the code calls `request_discard` on purpose (`prev_show_command`). This prevents a one-frame flash of id-clash outlines.
