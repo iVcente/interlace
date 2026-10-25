@@ -94,7 +94,7 @@ fn cli(argv: &[String]) -> i32 {
         project.output = PathBuf::from(out);
     }
 
-    println!("ffmpeg {}", project.to_args().join(" "));
+    println!("ffmpeg {}", run::join_args(&project.to_args()));
 
     if do_run {
         println!("→ output: {}", project.output.display());

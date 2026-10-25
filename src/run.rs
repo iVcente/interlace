@@ -214,6 +214,35 @@ pub fn tokenize(input: &str) -> Vec<String> {
     out
 }
 
+/// Render argv as one command line that [`tokenize`] splits back into exactly
+/// the same tokens. The command bar shows this text and runs whatever it holds
+/// once edited, so a path with spaces left unquoted would come back as several
+/// arguments.
+pub fn join_args(args: &[String]) -> String {
+    args.iter().map(|a| quote_arg(a)).collect::<Vec<_>>().join(" ")
+}
+
+/// Quote one token for [`tokenize`]. Plain tokens stay bare, so the common case
+/// still reads like a hand-typed command. Since `tokenize` has no escapes, a
+/// literal `"` can't sit inside `"…"`: it goes in its own `'"'` segment instead,
+/// and adjacent quoted segments join into one token.
+fn quote_arg(arg: &str) -> String {
+    let plain = !arg.is_empty() && !arg.chars().any(|c| c.is_whitespace() || c == '"' || c == '\'');
+    if plain {
+        return arg.to_owned();
+    }
+    let mut out = String::from("\"");
+    for c in arg.chars() {
+        if c == '"' {
+            out.push_str("\"'\"'\""); // close "…", emit '"', reopen "…"
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Accumulates the `key=value` lines of one progress block until its terminating
 /// `progress=` line, then flushes a `Progress`.
 #[derive(Default)]
@@ -380,5 +409,32 @@ progress=end\n";
         assert_eq!(tokenize("-metadata title='Le Film'"), vec!["-metadata", "title=Le Film"]);
         assert_eq!(tokenize(r#"-metadata title="""#), vec!["-metadata", "title="]);
         assert_eq!(tokenize("   "), Vec::<String>::new());
+    }
+
+    /// The command bar shows `join_args` and runs `tokenize` of it, so every
+    /// awkward token must come back unchanged.
+    #[test]
+    fn join_args_round_trips_through_tokenize() {
+        let args: Vec<String> = [
+            "-i",
+            r"C:\Users\me\Downloads\Todo Mundo em Pânico 4 (2006) @x.mp4",
+            "-metadata",
+            "title=Scary Movie 4 [2006]",
+            "-metadata:s:a:0",
+            "title=",
+            "",
+            r#"title=The "Cut""#,
+            "title=it's",
+            r#"both ' and ""#,
+        ]
+        .map(String::from)
+        .into();
+        assert_eq!(tokenize(&join_args(&args)), args);
+    }
+
+    #[test]
+    fn join_args_leaves_plain_tokens_bare() {
+        let args: Vec<String> = ["-map", "0:a:1", "-c:a:0", "libopus", r"C:\a\b.mkv"].map(String::from).into();
+        assert_eq!(join_args(&args), r"-map 0:a:1 -c:a:0 libopus C:\a\b.mkv");
     }
 }

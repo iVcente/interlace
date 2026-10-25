@@ -57,7 +57,8 @@ pub(super) fn show_command(ui: &mut egui::Ui, app: &mut InterlaceApp) {
         let mut text = match &app.command_edit {
             Some(edited) => edited.clone(),
             None => match &app.project {
-                Some(p) => format!("ffmpeg {}", p.to_args().join(" ")),
+                // Quoted so an edit round-trips through `run::tokenize`.
+                Some(p) => format!("ffmpeg {}", crate::run::join_args(&p.to_args())),
                 None => String::new(),
             },
         };
