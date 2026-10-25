@@ -30,6 +30,20 @@ fn output_takes_stream_tags(output: &Path) -> bool {
     )
 }
 
+/// The ffmpeg encoder to name in `-c` for a conversion target. The model keeps
+/// the *codec* name (`opus`) because validation compares it against ffprobe's
+/// `codec_name`; only the argv needs the encoder. `-c opus` would pick ffmpeg's
+/// native Opus encoder, which is experimental and refuses to run without
+/// `-strict -2`, so we name `libopus` explicitly. The other targets either are
+/// the native encoder's name (`aac`, `ac3`, `flac`) or resolve to the right
+/// default encoder by codec (`mp3` → `libmp3lame`).
+fn encoder_for(codec: &str) -> &str {
+    match codec {
+        "opus" => "libopus",
+        other => other,
+    }
+}
+
 /// Emit a `-metadata:s:<spec> key=value` pair for a per-stream tag, matching the
 /// output to the edited value:
 /// - `Some(v)` → set the tag to `v`, overriding the source's passthrough value.
@@ -119,7 +133,7 @@ impl Project {
                     channels,
                 } => {
                     a.push(format!("-c:{spec}"));
-                    a.push(codec.clone());
+                    a.push(encoder_for(codec).to_owned());
                     // `Auto` follows the probed source bitrate; `Default` resolves
                     // to `None` and emits no `-b` at all (encoder default).
                     if let Some(b) = bitrate.resolve(s.source.bitrate_kbps) {
@@ -311,7 +325,7 @@ mod tests {
         );
 
         let joined = project(&["in.mkv"], vec![v, audio]).to_args().join(" ");
-        assert!(joined.contains("-c:a:0 opus -b:a:0 160k"), "{joined}");
+        assert!(joined.contains("-c:a:0 libopus -b:a:0 160k"), "{joined}");
     }
 
     /// AUTO with an unknown source bitrate, and DEFAULT, both emit no `-b` flag.
