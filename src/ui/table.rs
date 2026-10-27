@@ -181,7 +181,7 @@ fn stream_row(
                 });
                 cell(ui, COL_ACTION, |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    for b in changes(s, input) {
+                    for b in changes(s) {
                         pill(ui, b.label, b.color, &b.hover);
                     }
                 });
@@ -282,8 +282,7 @@ struct Change {
 /// The badges describing how `s` differs from its probed original. A removed
 /// stream shows only the red `remove` badge; otherwise any of `embed` / `convert`
 /// / `retag` / `flags` / `offset` that apply (empty when the stream is untouched).
-/// `input` is the stream's source input, needed for the `embed`/`offset` badges.
-fn changes(s: &OutStream, input: &Input) -> Vec<Change> {
+fn changes(s: &OutStream) -> Vec<Change> {
     if s.removed {
         return vec![Change {
             label: "remove",
@@ -333,12 +332,12 @@ fn changes(s: &OutStream, input: &Input) -> Vec<Change> {
             ),
         });
     }
-    // A meaningful sync offset on the source input (same ≥1ms gate as `to_args`).
-    if input.has_offset() {
+    // A meaningful sync offset on this stream (same ≥1ms gate as `to_args`).
+    if s.has_offset() {
         out.push(Change {
             label: "offset",
             color: C_OFFSET,
-            hover: format!("timestamps shifted {:+.3} s", input.offset_secs),
+            hover: format!("timestamps shifted {:+.3} s", s.offset_secs),
         });
     }
     out
@@ -376,7 +375,8 @@ fn opt(v: &Option<String>) -> String {
 }
 
 /// Stream summary, mirroring the mockup: `flac » aac · jpn · "Japanese"` or, for
-/// an embedded track, `subrip · eng · from subs.srt · +0.15s`.
+/// an embedded track, `subrip · eng · from subs.srt · +0.15s` (any track with a
+/// sync offset ends with it).
 fn summary(s: &OutStream, input: &Input) -> String {
     let mut parts: Vec<String> = Vec::new();
     match &s.encode {
@@ -389,15 +389,14 @@ fn summary(s: &OutStream, input: &Input) -> String {
     if let Some(title) = &s.meta.title {
         parts.push(format!("\u{201C}{title}\u{201D}"));
     }
-    // Embedded tracks come from a non-primary input: name the file it came from,
-    // and its sync offset if one is set.
+    // Embedded tracks come from a non-primary input: name the file it came from.
     if s.source.input != 0 {
         let name = super::file_name_lossy(&input.path)
             .unwrap_or_else(|| format!("input {}", s.source.input));
         parts.push(format!("from {name}"));
-        if input.has_offset() {
-            parts.push(format!("{:+}s", trim_offset(input.offset_secs)));
-        }
+    }
+    if s.has_offset() {
+        parts.push(format!("{:+}s", trim_offset(s.offset_secs)));
     }
     parts.join(" · ")
 }
@@ -435,8 +434,14 @@ mod tests {
         s
     }
 
-    fn input(name: &str, offset_secs: f64) -> Input {
-        Input { path: PathBuf::from(name), offset_secs }
+    fn input(name: &str) -> Input {
+        Input::new(PathBuf::from(name))
+    }
+
+    /// `s` with its sync offset set to `secs`.
+    fn shifted(mut s: OutStream, secs: f64) -> OutStream {
+        s.offset_secs = secs;
+        s
     }
 
     fn labels(cs: &[Change]) -> Vec<&str> {
@@ -445,31 +450,39 @@ mod tests {
 
     #[test]
     fn embedded_summary_names_file_and_offset() {
-        let s = out(1, true, Meta { language: Some("eng".into()), ..Default::default() });
-        let text = summary(&s, &input("/media/subs.srt", 0.15));
+        let s = shifted(out(1, true, Meta { language: Some("eng".into()), ..Default::default() }), 0.15);
+        let text = summary(&s, &input("/media/subs.srt"));
         assert_eq!(text, "subrip · eng · from subs.srt · +0.15s");
     }
 
     #[test]
     fn embedded_summary_without_offset_omits_it() {
         let s = out(1, true, Meta::default());
-        let text = summary(&s, &input("subs.srt", 0.0));
+        let text = summary(&s, &input("subs.srt"));
         assert_eq!(text, "subrip · from subs.srt");
+    }
+
+    /// A track inside the primary file shows its offset too.
+    #[test]
+    fn primary_track_summary_shows_offset() {
+        let s = shifted(out(0, false, Meta::default()), -1.5);
+        assert_eq!(summary(&s, &input("in.mkv")), "subrip · -1.5s");
+        assert_eq!(labels(&changes(&s)), ["offset"]);
     }
 
     #[test]
     fn embed_and_offset_badges_on_embedded_track() {
-        let s = out(1, true, Meta::default());
-        assert_eq!(labels(&changes(&s, &input("subs.srt", -0.2))), ["embed", "offset"]);
+        let s = shifted(out(1, true, Meta::default()), -0.2);
+        assert_eq!(labels(&changes(&s)), ["embed", "offset"]);
     }
 
     #[test]
     fn no_embed_badge_for_primary_input_or_converted_sibling() {
         // A synthetic convert-sibling stays on input 0 → not an embed.
         let sibling = out(0, true, Meta::default());
-        assert!(!labels(&changes(&sibling, &input("in.mkv", 0.0))).contains(&"embed"));
+        assert!(!labels(&changes(&sibling)).contains(&"embed"));
         // A plain probed primary stream → no badges at all.
         let primary = out(0, false, Meta::default());
-        assert!(changes(&primary, &input("in.mkv", 0.0)).is_empty());
+        assert!(changes(&primary).is_empty());
     }
 }

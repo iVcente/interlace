@@ -48,39 +48,17 @@ impl Kind {
     }
 }
 
-/// One `-i` input file, plus a timestamp shift for syncing it against the rest.
-///
-/// The primary input (index 0) always has `offset_secs == 0.0`. An embedded track
-/// added in the editor can carry a nonzero offset, emitted as `-itsoffset` before
-/// its `-i` (see `args.rs`) to nudge it earlier or later.
+/// One `-i` input file. Sync offsets live on each `OutStream`, not here: one
+/// track inside a file can be shifted without moving the rest (see `args.rs`).
 #[derive(Debug, Clone)]
 pub struct Input {
     pub path: PathBuf,
-    /// Timestamp shift in seconds applied via `-itsoffset` (positive delays this
-    /// input, negative advances it). Always 0.0 for the primary input.
-    pub offset_secs: f64,
 }
 
 impl Input {
-    /// A plain input with no timestamp shift.
+    /// An input reading `path`.
     pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            offset_secs: 0.0,
-        }
-    }
-
-    /// The timestamp shift in whole milliseconds — the resolution ffmpeg is
-    /// actually given (`to_args` formats the offset to 3 decimals). Sub-millisecond
-    /// float noise rounds to 0, so this is the honest unit for "is there an offset".
-    pub fn offset_ms(&self) -> i64 {
-        (self.offset_secs * 1000.0).round() as i64
-    }
-
-    /// Whether this input carries a meaningful (≥ 1 ms) sync offset. The single
-    /// predicate the serializer and the table's badge/summary all share.
-    pub fn has_offset(&self) -> bool {
-        self.offset_ms() != 0
+        Self { path }
     }
 }
 
@@ -198,6 +176,11 @@ pub struct OutStream {
     /// streams aren't part of the original, so the UI deletes them outright
     /// instead of offering soft-removal / revert / extract.
     pub added: bool,
+    /// Timestamp shift in seconds (positive delays this stream, negative
+    /// advances it). Emitted as `-itsoffset` on the `-i` this stream is mapped
+    /// from; `args.rs` reads the file a second time when only some of its
+    /// streams are shifted.
+    pub offset_secs: f64,
 }
 
 impl OutStream {
@@ -212,7 +195,21 @@ impl OutStream {
             encode,
             removed: false,
             added: false,
+            offset_secs: 0.0,
         }
+    }
+
+    /// The timestamp shift in whole milliseconds — the resolution ffmpeg is
+    /// actually given (`to_args` formats the offset to 3 decimals). Sub-millisecond
+    /// float noise rounds to 0, so this is the honest unit for "is there an offset".
+    pub fn offset_ms(&self) -> i64 {
+        (self.offset_secs * 1000.0).round() as i64
+    }
+
+    /// Whether this stream carries a meaningful (≥ 1 ms) sync offset. The single
+    /// predicate the serializer and the table's badge/summary all share.
+    pub fn has_offset(&self) -> bool {
+        self.offset_ms() != 0
     }
 
     /// Language or title edited away from the probed original.

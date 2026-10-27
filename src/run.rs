@@ -104,8 +104,48 @@ pub fn run_raw(
     spawn(ffmpeg, args, duration)
 }
 
+/// Render a preview clip from `Project::preview_args`. The clip goes to a
+/// throwaway temp path, so `-y` is always safe; `len` is the clip length, which
+/// is what ffmpeg's `out_time` counts toward.
+pub fn run_preview(ffmpeg: &str, preview_args: Vec<String>, len: f64) -> Result<Receiver<RunUpdate>, String> {
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "warning".into(),
+        "-nostdin".into(),
+        "-progress".into(),
+        "pipe:1".into(),
+        "-y".into(),
+    ];
+    args.extend(preview_args);
+    spawn(ffmpeg, args, Some(len))
+}
+
+/// Open `path` in the user's default app for its type (the media player, for a
+/// preview clip). Fire-and-forget: Explorer hands the file off and returns a
+/// non-zero code even on success, so only a failure to launch is reported.
+#[cfg(windows)]
+pub fn open_in_default_app(path: &std::path::Path) -> Result<(), String> {
+    Command::new("explorer")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open {}: {e}", path.display()))
+}
+
+/// Non-Windows fallback, unused by the shipped build.
+#[cfg(not(windows))]
+pub fn open_in_default_app(path: &std::path::Path) -> Result<(), String> {
+    Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open {}: {e}", path.display()))
+}
+
 /// Launch ffmpeg with the fully-assembled `args` and stream updates back.
-/// Shared by [`run`] (model-driven) and [`run_raw`] (escape hatch).
+/// Shared by [`run`] (model-driven), [`run_raw`] (escape hatch) and
+/// [`run_preview`].
 fn spawn(ffmpeg: &str, args: Vec<String>, duration: Option<f64>) -> Result<Receiver<RunUpdate>, String> {
     let mut cmd = Command::new(ffmpeg);
     cmd.args(&args)
@@ -321,14 +361,14 @@ fn tail(lines: &[String], n: usize) -> String {
 
 /// Suppress the flashing console window when ffmpeg is launched from a GUI.
 #[cfg(windows)]
-fn no_window(cmd: &mut Command) {
+pub(crate) fn no_window(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(not(windows))]
-fn no_window(_cmd: &mut Command) {}
+pub(crate) fn no_window(_cmd: &mut Command) {}
 
 #[cfg(test)]
 mod tests {

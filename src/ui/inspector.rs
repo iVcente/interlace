@@ -6,7 +6,8 @@
 //! of the batch form. Each field shows the value every selected stream shares,
 //! or a "mixed" state (an empty box with a hint, an indeterminate checkbox, a
 //! "mixed" combo) when they differ, and an edit writes to all of them. Actions
-//! that only make sense for one stream (extract, sync offset) need exactly one.
+//! that only make sense for one stream (extract, sync offset, view cues) need
+//! exactly one.
 //!
 //! `language`/`title` map an empty field to `None` (inherit the original tag
 //! through the copy). The convert controls switch streams between `Encode::Copy`
@@ -15,7 +16,7 @@
 //! and `to_args()` skips it) so the change is visible and reversible via Restore.
 //! Synthetic (`added`) streams are deleted outright instead.
 
-use super::{InterlaceApp, card, section_label};
+use super::{InterlaceApp, card, close_button, section_label};
 use crate::model::{BITRATE_LADDER, Bitrate, Encode, Kind, Meta, OutStream, Project};
 
 const CODECS: [&str; 5] = ["aac", "ac3", "opus", "flac", "mp3"];
@@ -42,27 +43,8 @@ struct Deferred {
     remove: bool,
     /// Undo the soft removal of the selection.
     restore: bool,
-}
-
-/// A fixed 22×22 close button whose `×` is painted at the exact rect center
-/// (egui's `Button` can't perfectly center a lone glyph). The fixed footprint
-/// also stops hover expansion from reflowing the header. Returns `true` on click.
-fn close_button(ui: &mut egui::Ui) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-    let resp = resp.on_hover_text("Close inspector");
-    if ui.is_rect_visible(rect) {
-        let v = ui.style().interact(&resp);
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(4), v.weak_bg_fill);
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "×",
-            egui::FontId::proportional(16.0),
-            v.fg_stroke.color,
-        );
-    }
-    resp.clicked()
+    /// Open the cue viewer on the single selected subtitle stream.
+    view_cues: bool,
 }
 
 pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
@@ -104,6 +86,11 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     }
     if deferred.close {
         app.selection.clear();
+    }
+    if deferred.view_cues
+        && let [idx] = rows.as_slice()
+    {
+        app.open_cues(*idx);
     }
 }
 
@@ -158,7 +145,7 @@ fn header(ui: &mut egui::Ui, project: &Project, rows: &[usize], deferred: &mut D
     ui.horizontal(|ui| {
         section_label(ui, &title);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if close_button(ui) {
+            if close_button(ui, "Close inspector") {
                 deferred.close = true;
             }
         });
@@ -405,6 +392,10 @@ fn actions_section(ui: &mut egui::Ui, project: &Project, rows: &[usize], deferre
         }
     }
 
+    if let [idx] = rows {
+        cues_row(ui, &project.streams[*idx], deferred);
+    }
+
     // Extract: one original stream at a time (a synthetic stream isn't in the
     // source file, so there's nothing to extract).
     match rows {
@@ -418,6 +409,28 @@ fn actions_section(ui: &mut egui::Ui, project: &Project, rows: &[usize], deferre
             });
         }
     }
+}
+
+/// The "view cues…" button for a single subtitle stream. Disabled, with the
+/// reason beside it, for image-based subtitles, which have no text to list.
+fn cues_row(ui: &mut egui::Ui, stream: &OutStream, deferred: &mut Deferred) {
+    if stream.source.kind != Kind::Subtitle {
+        return;
+    }
+    let text = crate::subs::is_text_subtitle(&stream.source.codec);
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(text, egui::Button::new("view cues…"))
+            .on_hover_text("List this subtitle's lines and timings")
+            .clicked()
+        {
+            deferred.view_cues = true;
+        }
+        if !text {
+            ui.add(egui::Label::new(egui::RichText::new("image-based subtitles have no text").weak()).truncate());
+        }
+    });
 }
 
 /// The extract button for `streams[idx]` with a preview of its output name.
@@ -453,13 +466,14 @@ fn extract_row(ui: &mut egui::Ui, project: &Project, idx: usize, deferred: &mut 
     });
 }
 
-/// Sync offset for a single embedded track. Only added inputs (index > 0) can be
-/// shifted; the primary is the clock everything else syncs against. It's an
-/// input-level setting, so it's offered only when exactly one stream is selected.
+/// Sync offset for a single audio or subtitle track, whether embedded from an
+/// added file or already inside the primary. Video isn't offered: it's the clock
+/// everything else syncs against. A shifted track inside the primary costs a
+/// second read of that file during the run (see `args.rs`), so the hint says so.
 fn offset_section(ui: &mut egui::Ui, project: &mut Project, rows: &[usize]) {
     let [idx] = rows else { return };
-    let input_idx = project.streams[*idx].source.input;
-    if input_idx == 0 {
+    let stream = &mut project.streams[*idx];
+    if !matches!(stream.source.kind, Kind::Audio | Kind::Subtitle) {
         return;
     }
     ui.add_space(8.0);
@@ -467,27 +481,31 @@ fn offset_section(ui: &mut egui::Ui, project: &mut Project, rows: &[usize]) {
     ui.add_space(6.0);
     section_label(ui, "SYNC OFFSET");
     ui.add_space(6.0);
-    let input = &mut project.inputs[input_idx];
-    ui.horizontal(|ui| {
-        if ui.button("−").on_hover_text("Advance 0.05 s").clicked() {
-            input.offset_secs -= 0.05;
-        }
-        ui.add(
-            egui::DragValue::new(&mut input.offset_secs)
-                .suffix(" s")
-                .speed(0.01)
-                .max_decimals(3)
-                .range(-3600.0..=3600.0),
-        );
-        if ui.button("+").on_hover_text("Delay 0.05 s").clicked() {
-            input.offset_secs += 0.05;
-        }
-        if ui.button("⟲").on_hover_text("Reset to 0").clicked() {
-            input.offset_secs = 0.0;
-        }
+    ui.add_enabled_ui(!stream.removed, |ui| {
+        ui.horizontal(|ui| {
+            if ui.button("−").on_hover_text("Advance 0.05 s").clicked() {
+                stream.offset_secs -= 0.05;
+            }
+            ui.add(
+                egui::DragValue::new(&mut stream.offset_secs)
+                    .suffix(" s")
+                    .speed(0.01)
+                    .max_decimals(3)
+                    .range(-3600.0..=3600.0),
+            );
+            if ui.button("+").on_hover_text("Delay 0.05 s").clicked() {
+                stream.offset_secs += 0.05;
+            }
+            if ui.button("⟲").on_hover_text("Reset to 0").clicked() {
+                stream.offset_secs = 0.0;
+            }
+        });
     });
     ui.add_space(4.0);
     ui.weak("+ delays this track, − advances it.");
+    if stream.source.input == 0 && stream.has_offset() {
+        ui.weak("The run reads the file once more to shift just this track.");
+    }
 }
 
 /// A captioned field: small label above its widget, matching the mockup.

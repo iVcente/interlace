@@ -5,6 +5,9 @@
 //! `:a:1` for every later option, regardless of its source index. So we walk the
 //! streams in output order and keep a per-type counter; every `-c` / `-metadata`
 //! / `-disposition` uses that output index, not the source index.
+//!
+//! `preview_args` reuses the same body to render a short window of the output
+//! for a preview clip; its doc explains how seeks and sync offsets combine.
 
 use crate::model::{Encode, Kind, OutStream, Project};
 use std::collections::HashMap;
@@ -44,6 +47,21 @@ fn encoder_for(codec: &str) -> &str {
     }
 }
 
+/// How a preview clip encodes video, as `(option, value)` pairs that get the
+/// stream's output specifier appended (`-c:v:0`, ...). Stream-copied video can
+/// only start on a keyframe, often seconds into the window, and players freeze
+/// on the first frame until it arrives. Re-encoding lets the input seek trim to
+/// the exact start. It's a throwaway clip, so speed wins: `ultrafast`, scaled
+/// down to at most 720p, and 8-bit 4:2:0 so any player can decode it.
+const PREVIEW_VIDEO: &[(&str, &str)] = &[
+    ("-c", "libx264"),
+    ("-preset", "ultrafast"),
+    ("-crf", "23"),
+    ("-pix_fmt", "yuv420p"),
+    // `\,` escapes the comma from ffmpeg's filtergraph parser; no shell involved.
+    ("-filter", r"scale=-2:min(ih\,720)"),
+];
+
 /// Emit a `-metadata:s:<spec> key=value` pair for a per-stream tag, matching the
 /// output to the edited value:
 /// - `Some(v)` → set the tag to `v`, overriding the source's passthrough value.
@@ -65,6 +83,52 @@ fn push_tag(a: &mut Vec<String>, spec: &str, key: &str, cur: &Option<String>, or
     }
 }
 
+/// Which `-i`s the command opens, and which one each live stream is mapped from.
+///
+/// ffmpeg's `-itsoffset` shifts a whole input, so a stream whose offset differs
+/// from the rest of its file is read from a second `-i` of the same file that
+/// carries that offset. Every model input keeps its own `-i` at its own index
+/// first — input 0 stays first, which is where ffmpeg takes chapters and global
+/// metadata from — and the extra reads follow, one per distinct (file, offset).
+struct InputPlan {
+    /// `(model input index, offset in ms)` for each `-i`, in argv order.
+    inputs: Vec<(usize, i64)>,
+    /// For each live stream (in output order), the argv `-i` index it maps from.
+    map_from: Vec<usize>,
+}
+
+impl InputPlan {
+    /// Plan the inputs for `live`, the project's mapped streams in output order.
+    fn new(project: &Project, live: &[&OutStream]) -> Self {
+        // A model input's own `-i` takes the offset of its first live stream, so
+        // a single shifted track (an added `.srt`) needs no second read. The
+        // primary keeps 0: shifting it would shift chapters and every other track.
+        let base = |k: usize| -> i64 {
+            if k == 0 {
+                return 0;
+            }
+            live.iter()
+                .find(|s| s.source.input == k)
+                .map_or(0, |s| s.offset_ms())
+        };
+        let mut inputs: Vec<(usize, i64)> = (0..project.inputs.len()).map(|k| (k, base(k))).collect();
+        let map_from = live
+            .iter()
+            .map(|s| {
+                let key = (s.source.input, s.offset_ms());
+                if inputs[s.source.input] == key {
+                    return s.source.input;
+                }
+                inputs.iter().position(|&i| i == key).unwrap_or_else(|| {
+                    inputs.push(key);
+                    inputs.len() - 1
+                })
+            })
+            .collect();
+        Self { inputs, map_from }
+    }
+}
+
 impl Project {
     /// Render this project as the argument vector for `ffmpeg` (the program name
     /// itself is not included). Passed straight to `std::process::Command`, so no
@@ -73,31 +137,78 @@ impl Project {
     /// Deliberately does **not** emit `-y`/`-n`: overwrite policy is decided by
     /// the run layer after an existence check, not baked into the command here.
     pub fn to_args(&self) -> Vec<String> {
+        self.to_args_windowed(None)
+    }
+
+    /// The argv for a short preview clip: this project's exact command, cut to
+    /// `len` seconds from `start` (output time) and written to `out`.
+    ///
+    /// Each input is seeked on its own with `-ss` before its `-i`. ffmpeg shifts
+    /// an input's timestamps by `itsoffset - seek`, so an input with offset `o` is
+    /// seeked to `start - o` *instead of* taking `-itsoffset`: a source time `t`
+    /// lands at `t + o - start`, the same relative sync as the full run, and the
+    /// cues an offset moves into the window are read rather than skipped. Near the
+    /// file start the seek clamps at 0 and the remainder goes back into
+    /// `-itsoffset` (see `to_args_windowed`).
+    ///
+    /// An input seek is only coarse under stream copy: video restarts at the
+    /// keyframe before the seek point, and text subtitle demuxers (`.srt`) don't
+    /// seek at all, so every earlier cue arrives with a negative timestamp. The
+    /// muxer would then shift the whole clip to make those non-negative, leaving
+    /// the window minutes in. An *output* `-ss 0` drops everything before the
+    /// window instead, so the clip's time 0 is `start`. Video is re-encoded
+    /// (`PREVIEW_VIDEO`) so it, too, starts exactly there rather than at the next
+    /// keyframe.
+    pub fn preview_args(&self, start: f64, len: f64, out: &Path) -> Vec<String> {
+        let mut clip = self.clone();
+        clip.output = out.to_path_buf();
+        clip.to_args_windowed(Some((start, len)))
+    }
+
+    /// The shared body of [`Project::to_args`] and [`Project::preview_args`].
+    /// `window` is `(start, len)` in output seconds; `None` renders everything.
+    fn to_args_windowed(&self, window: Option<(f64, f64)>) -> Vec<String> {
         let mut a: Vec<String> = Vec::new();
 
-        // Inputs, in order — their position defines the `-i` index streams refer to.
-        // A synced input gets `-itsoffset <secs>` right before its `-i`. We gate on
-        // integer milliseconds so tiny float noise never emits a spurious offset,
-        // and format with a fixed `.` decimal (locale-independent, no `1e-1` forms).
-        for input in &self.inputs {
-            let ms = input.offset_ms();
+        // Only streams not marked for removal reach the output; a removed stream
+        // is simply never mapped (and doesn't count toward per-type renumbering).
+        let live: Vec<&OutStream> = self.streams.iter().filter(|s| !s.removed).collect();
+        let plan = InputPlan::new(self, &live);
+
+        // Inputs, in plan order — their position defines the `-i` index the maps
+        // refer to. A shifted one gets `-itsoffset <secs>` right before its `-i`.
+        // Offsets are integer milliseconds so tiny float noise never emits a
+        // spurious one, and format with a fixed `.` decimal (locale-independent,
+        // no `1e-1` forms).
+        for &(input, offset_ms) in &plan.inputs {
+            let offset = offset_ms as f64 / 1000.0;
+            // A preview seeks this input to `start - offset`, clamped at 0; only
+            // the part the clamp couldn't absorb is left for `-itsoffset`.
+            let (seek, shift) = match window {
+                Some((start, _)) => {
+                    let seek = (start - offset).max(0.0);
+                    (seek, offset - start + seek)
+                }
+                None => (0.0, offset),
+            };
+            if seek >= 0.0005 {
+                a.push("-ss".into());
+                a.push(format!("{seek:.3}"));
+            }
+            let ms = (shift * 1000.0).round() as i64;
             if ms != 0 {
                 a.push("-itsoffset".into());
                 a.push(format!("{:.3}", ms as f64 / 1000.0)); // e.g. "0.200", "-0.150"
             }
             a.push("-i".into());
-            a.push(input.path.display().to_string());
+            a.push(self.inputs[input].path.display().to_string());
         }
-
-        // Only streams not marked for removal reach the output; a removed stream
-        // is simply never mapped (and doesn't count toward per-type renumbering).
-        let live: Vec<&OutStream> = self.streams.iter().filter(|s| !s.removed).collect();
 
         // Maps first, in output order. This is what actually fixes ordering:
         // ffmpeg emits streams in the order they're mapped.
-        for s in &live {
+        for (s, arg_input) in live.iter().zip(&plan.map_from) {
             a.push("-map".into());
-            a.push(format!("{}:{}", s.source.input, s.source.index));
+            a.push(format!("{arg_input}:{}", s.source.index));
         }
 
         // Raw/elementary outputs (extraction) reject per-stream tags entirely.
@@ -121,8 +232,15 @@ impl Project {
             *slot += 1;
             let spec = format!("{c}:{n}"); // e.g. "a:0"
 
-            // Codec: copy for everything except the audio-conversion path.
+            // Codec: copy for everything except the audio-conversion path — and,
+            // in a preview, video (see `PREVIEW_VIDEO`).
             match &s.encode {
+                Encode::Copy if window.is_some() && s.source.kind == Kind::Video => {
+                    for (flag, value) in PREVIEW_VIDEO {
+                        a.push(format!("{flag}:{spec}"));
+                        a.push((*value).into());
+                    }
+                }
                 Encode::Copy => {
                     a.push(format!("-c:{spec}"));
                     a.push("copy".into());
@@ -176,6 +294,14 @@ impl Project {
             });
         }
 
+        if let Some((_, len)) = window {
+            // Output-side: drop whatever the coarse input seeks let through from
+            // before the window (see `preview_args`).
+            a.push("-ss".into());
+            a.push("0".into());
+            a.push("-t".into());
+            a.push(format!("{len:.3}"));
+        }
         a.push(self.output.display().to_string());
         a
     }
@@ -184,7 +310,7 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use crate::model::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     // --- small builders to keep the tests readable ---------------------------
 
@@ -479,7 +605,7 @@ mod tests {
         let sub = OutStream::new(src(1, 0, Kind::Subtitle, "subrip"), lang("eng"), Encode::Copy);
 
         let mut p = project(&["vid.mkv", "subs.srt"], vec![v, sub]);
-        p.inputs[1].offset_secs = -0.2; // advance the subtitle by 200ms
+        p.streams[1].offset_secs = -0.2; // advance the subtitle by 200ms
         let args = p.to_args();
 
         // The token right before the second `-i` is the offset; the first `-i` has none.
@@ -512,7 +638,149 @@ mod tests {
         let v = keep(src(0, 0, Kind::Video, "h264"), Meta::default());
         let a = keep(src(1, 0, Kind::Audio, "flac"), Meta::default());
         let mut p = project(&["vid.mkv", "extra.flac"], vec![v, a]);
-        p.inputs[1].offset_secs = 0.3;
+        p.streams[1].offset_secs = 0.3;
         assert_eq!(values_after(&p.to_args(), "-itsoffset"), ["0.300"]);
+    }
+
+    // --- preview clips --------------------------------------------------------
+
+    /// A video plus an embedded subtitle shifted by `offset` seconds.
+    fn synced(offset: f64) -> Project {
+        let v = keep(src(0, 0, Kind::Video, "h264"), Meta::default());
+        let sub = OutStream::new(src(1, 0, Kind::Subtitle, "subrip"), lang("eng"), Encode::Copy);
+        let mut p = project(&["vid.mkv", "subs.srt"], vec![v, sub]);
+        p.streams[1].offset_secs = offset;
+        p
+    }
+
+    /// Every input gets its own `-ss` right before its `-i`, the clip length goes
+    /// before the output, and the output is the preview path.
+    #[test]
+    fn preview_seeks_each_input_and_limits_length() {
+        let args = synced(0.0).preview_args(60.0, 30.0, Path::new("prev.mkv"));
+        assert_eq!(input_seeks(&args), ["60.000", "60.000"]);
+        for (i, a) in args.iter().enumerate() {
+            if a == "-i" {
+                assert_eq!(args[i - 2], "-ss", "{args:?}");
+            }
+        }
+        // The output-side `-ss 0` trims what the coarse input seeks let through.
+        let n = args.len();
+        assert_eq!(&args[n - 5..], ["-ss", "0", "-t", "30.000", "prev.mkv"]);
+    }
+
+    /// The `-ss` values placed before an `-i` (input seeks), skipping the
+    /// output-side `-ss 0`.
+    fn input_seeks(args: &[String]) -> Vec<String> {
+        args.windows(3)
+            .filter(|w| w[0] == "-ss" && w[2] == "-i")
+            .map(|w| w[1].clone())
+            .collect()
+    }
+
+    /// An offset input is seeked to `start - offset` and takes no `-itsoffset`,
+    /// which keeps its relative sync without skipping cues the offset pulls in.
+    #[test]
+    fn preview_folds_offset_into_the_seek() {
+        let args = synced(2.0).preview_args(60.0, 30.0, Path::new("prev.mkv"));
+        assert_eq!(input_seeks(&args), ["60.000", "58.000"]);
+        assert!(values_after(&args, "-itsoffset").is_empty(), "{args:?}");
+
+        let args = synced(-1.5).preview_args(60.0, 30.0, Path::new("prev.mkv"));
+        assert_eq!(input_seeks(&args), ["60.000", "61.500"]);
+    }
+
+    /// Near the file start the seek clamps at 0 and the rest of the shift is left
+    /// to `-itsoffset`: start 1 s with a +3 s offset → no seek, shift +2 s.
+    #[test]
+    fn preview_clamped_seek_keeps_the_remaining_shift() {
+        let args = synced(3.0).preview_args(1.0, 30.0, Path::new("prev.mkv"));
+        assert_eq!(input_seeks(&args), ["1.000"], "only the primary seeks");
+        assert_eq!(values_after(&args, "-itsoffset"), ["2.000"]);
+    }
+
+    /// A preview re-encodes video (so it starts on time, not at the next
+    /// keyframe) but still copies the subtitle.
+    #[test]
+    fn preview_reencodes_video_and_copies_the_rest() {
+        let args = synced(0.0).preview_args(60.0, 30.0, Path::new("prev.mkv"));
+        assert_eq!(values_after(&args, "-c:v:0"), ["libx264"]);
+        assert_eq!(values_after(&args, "-filter:v:0"), [r"scale=-2:min(ih\,720)"]);
+        assert_eq!(values_after(&args, "-c:s:0"), ["copy"]);
+    }
+
+    /// The preview path leaves the real command untouched.
+    #[test]
+    fn preview_does_not_change_to_args() {
+        let p = synced(0.25);
+        let before = p.to_args();
+        let _ = p.preview_args(10.0, 30.0, Path::new("prev.mkv"));
+        assert_eq!(p.to_args(), before);
+        assert!(!before.contains(&"-ss".to_string()) && !before.contains(&"-t".to_string()));
+        assert_eq!(values_after(&before, "-itsoffset"), ["0.250"]);
+        assert_eq!(values_after(&before, "-c:v:0"), ["copy"]);
+    }
+
+    // --- per-stream offsets on tracks inside a file -------------------------
+
+    /// A video, two audio tracks and a subtitle, all in one file.
+    fn movie() -> Project {
+        project(
+            &["movie.mkv"],
+            vec![
+                keep(src(0, 0, Kind::Video, "h264"), Meta::default()),
+                keep(src(0, 1, Kind::Audio, "aac"), lang("eng")),
+                keep(src(0, 2, Kind::Audio, "aac"), lang("jpn")),
+                keep(src(0, 3, Kind::Subtitle, "subrip"), lang("eng")),
+            ],
+        )
+    }
+
+    /// Shifting one track inside the primary reads the file a second time with
+    /// the offset and maps just that track from it; the rest stay on input 0.
+    #[test]
+    fn shifted_track_in_primary_maps_from_a_second_read() {
+        let mut p = movie();
+        p.streams[3].offset_secs = 1.5;
+        let args = p.to_args();
+        assert_eq!(&args[..5], ["-i", "movie.mkv", "-itsoffset", "1.500", "-i"]);
+        assert_eq!(args[5], "movie.mkv");
+        assert_eq!(values_after(&args, "-map"), ["0:0", "0:1", "0:2", "1:3"]);
+    }
+
+    /// Tracks sharing an offset share one extra read; a different offset gets
+    /// its own.
+    #[test]
+    fn one_extra_read_per_distinct_offset() {
+        let mut p = movie();
+        p.streams[1].offset_secs = -0.5;
+        p.streams[3].offset_secs = -0.5;
+        p.streams[2].offset_secs = 0.25;
+        let args = p.to_args();
+        assert_eq!(values_after(&args, "-itsoffset"), ["-0.500", "0.250"]);
+        assert_eq!(values_after(&args, "-i").len(), 3);
+        assert_eq!(values_after(&args, "-map"), ["0:0", "1:1", "2:2", "1:3"]);
+    }
+
+    /// A removed shifted track doesn't cause an extra read.
+    #[test]
+    fn removed_shifted_track_adds_no_read() {
+        let mut p = movie();
+        p.streams[3].offset_secs = 1.0;
+        p.streams[3].removed = true;
+        let args = p.to_args();
+        assert_eq!(values_after(&args, "-i"), ["movie.mkv"]);
+        assert!(values_after(&args, "-itsoffset").is_empty());
+    }
+
+    /// A preview seeks each read on its own: the shifted read of the same file
+    /// seeks to `start - offset`.
+    #[test]
+    fn preview_seeks_the_shifted_read_separately() {
+        let mut p = movie();
+        p.streams[3].offset_secs = 2.0;
+        let args = p.preview_args(60.0, 30.0, Path::new("prev.mkv"));
+        assert_eq!(input_seeks(&args), ["60.000", "58.000"]);
+        assert_eq!(values_after(&args, "-map"), ["0:0", "0:1", "0:2", "1:3"]);
     }
 }

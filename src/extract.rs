@@ -38,7 +38,7 @@ impl Project {
             Encode::Copy, // extraction never re-encodes
         );
 
-        // A fresh single-input project: the offset resets to 0 (nothing to sync
+        // A fresh single-stream project: the offset resets to 0 (nothing to sync
         // against once the stream stands alone).
         Some(Project {
             inputs: vec![Input::new(input)],
@@ -167,15 +167,13 @@ mod tests {
 
     #[test]
     fn extract_resets_offset() {
-        // A second input with a sync offset, and a stream drawn from it.
+        // A second input, and a stream drawn from it with a sync offset.
         let mut p = project(vec![stream(1, 0, Kind::Audio, "flac", Some("eng"))]);
-        p.inputs.push(Input {
-            path: PathBuf::from("/media/extra.flac"),
-            offset_secs: -0.2,
-        });
+        p.inputs.push(Input::new(PathBuf::from("/media/extra.flac")));
+        p.streams[0].offset_secs = -0.2;
         let x = p.extract(0).unwrap();
-        // The extracted single-input project carries no offset.
-        assert_eq!(x.inputs[0].offset_secs, 0.0);
+        // The extracted single-stream project carries no offset.
+        assert_eq!(x.streams[0].offset_secs, 0.0);
         assert!(!x.to_args().join(" ").contains("-itsoffset"));
     }
 

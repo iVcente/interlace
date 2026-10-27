@@ -11,8 +11,10 @@
 mod args;
 mod extract;
 mod model;
+mod preview;
 mod probe;
 mod run;
+mod subs;
 mod ui;
 mod validate;
 

@@ -16,8 +16,12 @@
 //! Media enters through the sources-bar pickers or by dropping files onto the
 //! window. Drops reuse the picker paths (`load_file` / `embed_file`), routed by
 //! extension against the same `TRACK_EXTENSIONS` list the track picker filters on.
+//!
+//! The subtitle cue viewer (`cues`) docks under the inspector in the right-hand
+//! panel, opened from the inspector for one text subtitle stream.
 
 mod command;
+mod cues;
 mod inspector;
 mod selection;
 mod sources;
@@ -36,6 +40,8 @@ pub(crate) enum RunState {
         rx: Receiver<RunUpdate>,
         fraction: f32,
         line: String,
+        /// A preview clip to open in the default player once the run succeeds.
+        open_on_success: Option<PathBuf>,
     },
     Done {
         ok: bool,
@@ -59,6 +65,17 @@ pub struct InterlaceApp {
     /// mirrors `to_args()` live); `Some` means the user has edited it, so Run
     /// executes this text verbatim instead. Reset to `None` on load or "Reset".
     pub(crate) command_edit: Option<String>,
+    /// The subtitle cue viewer (`cues.rs`); `None` until one is opened. Kept when
+    /// its window closes so reopening the same stream needn't re-read the file.
+    pub(crate) cues: Option<cues::CueView>,
+    /// The preview clip's start time as typed (`hh:mm:ss`, `mm:ss` or seconds),
+    /// in output time. Kept as text so a half-typed value isn't reformatted under
+    /// the cursor; clicking a cue in the viewer writes it.
+    pub(crate) preview_start: String,
+    /// The preview clip's length in seconds, one of `preview::LENGTHS`.
+    pub(crate) preview_len: f64,
+    /// Every preview clip rendered this session, deleted when the app closes.
+    preview_clips: Vec<PathBuf>,
     pub(crate) ffprobe: String,
     pub(crate) ffmpeg: String,
     /// Cached results of the last `<bin> -version` probe (`Ok(version-line)` or a
@@ -80,6 +97,7 @@ impl InterlaceApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::empty();
         app.recheck_binaries(); // detect ffmpeg/ffprobe up front
+        crate::preview::sweep_temp(); // clips left over from earlier sessions
         app
     }
 
@@ -91,6 +109,10 @@ impl InterlaceApp {
             run_state: RunState::Idle,
             pending_run: None,
             command_edit: None,
+            cues: None,
+            preview_start: "00:00:00".into(),
+            preview_len: 30.0,
+            preview_clips: Vec::new(),
             ffprobe: "ffprobe".into(),
             ffmpeg: "ffmpeg".into(),
             ffmpeg_status: Ok(String::new()),
@@ -125,7 +147,7 @@ impl InterlaceApp {
                 self.error = None;
                 self.run_state = RunState::Idle;
                 self.command_edit = None; // a new file starts from the model
-
+                self.cues = None;
             }
             Err(e) => self.error = Some(e),
         }
@@ -304,16 +326,58 @@ impl InterlaceApp {
     pub(crate) fn start_run_edited(&mut self, command: &str) {
         let args = command_args(command);
         let duration = self.project.as_ref().and_then(|p| p.duration_secs);
-        self.run_state = run_state_from(run::run_raw(&self.ffmpeg, args, duration));
+        self.run_state = run_state_from(run::run_raw(&self.ffmpeg, args, duration), None);
     }
 
     fn start_run_project(&mut self, project: Project, overwrite: bool) {
-        self.run_state = run_state_from(run::run(&self.ffmpeg, &project, overwrite));
+        self.run_state = run_state_from(run::run(&self.ffmpeg, &project, overwrite), None);
+    }
+
+    /// Why a preview can't start right now, or `None` when it can. Drives both
+    /// the button's enabled state and its hover text.
+    pub(crate) fn preview_blocker(&self) -> Option<&'static str> {
+        if self.project.is_none() {
+            Some("Open a file first")
+        } else if matches!(self.run_state, RunState::Running { .. }) {
+            Some("Wait for the current run to finish")
+        } else if self.command_edit.is_some() {
+            Some("The preview follows the editor, not the edited command — reset the command first")
+        } else if crate::preview::parse_timestamp(&self.preview_start).is_none() {
+            Some("Enter a start time like 00:12:30, 12:30 or 750")
+        } else {
+            None
+        }
+    }
+
+    /// Render a `preview_len`-second clip of the current project from
+    /// `preview_start` and open it in the default player when it's done. The
+    /// single selected audio/subtitle stream is made the default of its kind so
+    /// the player starts on it (see `preview::focused`).
+    pub(crate) fn start_preview(&mut self) {
+        if self.preview_blocker().is_some() {
+            return;
+        }
+        let (Some(project), Some(start)) = (&self.project, crate::preview::parse_timestamp(&self.preview_start))
+        else {
+            return;
+        };
+        let clip = crate::preview::focused(project, self.selection.single());
+        let out = crate::preview::next_path();
+        let args = clip.preview_args(start, self.preview_len, &out);
+        self.preview_clips.push(out.clone());
+        self.error = None;
+        self.run_state = run_state_from(run::run_preview(&self.ffmpeg, args, self.preview_len), Some(out));
     }
 
     /// Drain progress updates each frame while a run is active.
     fn poll_run(&mut self, ctx: &egui::Context) {
-        let RunState::Running { rx, fraction, line } = &mut self.run_state else {
+        let RunState::Running {
+            rx,
+            fraction,
+            line,
+            open_on_success,
+        } = &mut self.run_state
+        else {
             return;
         };
         let mut finished: Option<(bool, String)> = None;
@@ -326,9 +390,13 @@ impl InterlaceApp {
                     *line = progress_line(&p);
                 }
                 Ok(RunUpdate::Finished { result }) => {
-                    finished = Some(match result {
-                        Ok(()) => (true, "done".into()),
-                        Err(f) => (false, failure_line(&f)),
+                    finished = Some(match (result, open_on_success.as_deref()) {
+                        (Ok(()), None) => (true, "done".into()),
+                        (Ok(()), Some(clip)) => match run::open_in_default_app(clip) {
+                            Ok(()) => (true, "preview opened".into()),
+                            Err(e) => (false, e),
+                        },
+                        (Err(f), _) => (false, failure_line(&f)),
                     });
                     break;
                 }
@@ -352,6 +420,7 @@ impl InterlaceApp {
     /// so it can be driven headlessly in tests via `Context::run_ui`.
     fn render(&mut self, ui: &mut egui::Ui) {
         self.poll_run(ui.ctx());
+        cues::poll(ui.ctx(), self);
 
         // Files dropped onto the window this frame. Entries without a path (web
         // drops carrying only bytes) and folders have nothing for ffprobe to read.
@@ -384,9 +453,21 @@ impl InterlaceApp {
             .default_size(320.0)
             .size_range(260.0..=460.0)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    inspector::show(ui, self);
-                });
+                // With the cue panel docked below, the inspector scrolls within
+                // the top part and the cues take the rest; on its own it can use
+                // the full height. Either way it shrinks to its content.
+                let docked = cues::is_open(self);
+                let max = if docked { ui.available_height() * 0.6 } else { f32::INFINITY };
+                egui::ScrollArea::vertical()
+                    .id_salt("inspector_scroll")
+                    .max_height(max)
+                    .show(ui, |ui| {
+                        inspector::show(ui, self);
+                    });
+                if docked {
+                    ui.add_space(8.0);
+                    cues::panel(ui, self);
+                }
             });
 
         // The command bar is a resizable bottom panel, like the inspector on the
@@ -508,6 +589,17 @@ impl InterlaceApp {
     }
 }
 
+/// eframe drops the app when the window closes; that's when this session's
+/// preview clips go. Best-effort: a clip still open in a player stays locked on
+/// Windows and is left for the next startup sweep (`preview::sweep_temp`).
+impl Drop for InterlaceApp {
+    fn drop(&mut self) {
+        for clip in &self.preview_clips {
+            let _ = std::fs::remove_file(clip);
+        }
+    }
+}
+
 impl eframe::App for InterlaceApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.render(ui);
@@ -532,12 +624,14 @@ fn command_args(command: &str) -> Vec<String> {
 /// Turn a spawn result into the initial `RunState`: a live `Running` on success,
 /// or a `Done` carrying the launch error. Shared by the model-driven and
 /// escape-hatch run paths so their starting state can't drift apart.
-fn run_state_from(result: Result<Receiver<RunUpdate>, String>) -> RunState {
+/// `open_on_success` is the preview clip to open when the run finishes.
+fn run_state_from(result: Result<Receiver<RunUpdate>, String>, open_on_success: Option<PathBuf>) -> RunState {
     match result {
         Ok(rx) => RunState::Running {
             rx,
             fraction: 0.0,
             line: "starting…".into(),
+            open_on_success,
         },
         Err(e) => RunState::Done { ok: false, line: e },
     }
@@ -625,6 +719,28 @@ pub(super) fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
             add(ui);
         });
 }
+/// A fixed 22×22 close button whose `×` is painted at the exact rect center
+/// (egui's `Button` can't perfectly center a lone glyph). The fixed footprint
+/// also stops hover expansion from reflowing the header. Shared by the
+/// inspector and the cue panel headers. Returns `true` on click.
+pub(super) fn close_button(ui: &mut egui::Ui, hover: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+    let resp = resp.on_hover_text(hover);
+    if ui.is_rect_visible(rect) {
+        let v = ui.style().interact(&resp);
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(4), v.weak_bg_fill);
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            egui::FontId::proportional(16.0),
+            v.fg_stroke.color,
+        );
+    }
+    resp.clicked()
+}
+
 /// A small uppercase section heading like "SOURCES" / "INSPECTOR".
 pub(super) fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.label(
@@ -812,16 +928,14 @@ mod tests {
         let mut app = app_with_demo(); // 3 streams, all from input 0
         {
             let p = app.project.as_mut().unwrap();
-            p.inputs.push(Input {
-                path: PathBuf::from("subs.srt"),
-                offset_secs: -0.2,
-            });
+            p.inputs.push(Input::new(PathBuf::from("subs.srt")));
             let mut embedded = OutStream::new(
                 Source { input: 1, index: 0, kind: Kind::Subtitle, codec: "subrip".into(), bitrate_kbps: None },
                 Meta { language: Some("eng".into()), ..Default::default() },
                 Encode::Copy,
             );
             embedded.added = true;
+            embedded.offset_secs = -0.2;
             p.streams.push(embedded);
         }
         let last = app.project.as_ref().unwrap().streams.len() - 1;
@@ -840,16 +954,14 @@ mod tests {
         let mut app = app_with_demo();
         {
             let p = app.project.as_mut().unwrap();
-            p.inputs.push(Input {
-                path: PathBuf::from("commentary.flac"),
-                offset_secs: 0.15,
-            });
+            p.inputs.push(Input::new(PathBuf::from("commentary.flac")));
             let mut embedded = OutStream::new(
                 Source { input: 1, index: 0, kind: Kind::Audio, codec: "flac".into(), bitrate_kbps: None },
                 Meta::default(),
                 Encode::Copy,
             );
             embedded.added = true;
+            embedded.offset_secs = 0.15;
             p.streams.push(embedded);
         }
         app.selection.set_single(app.project.as_ref().unwrap().streams.len() - 1);
@@ -1015,6 +1127,77 @@ mod tests {
         embedded.added = true;
         p.streams.push(embedded);
         p.streams.len() - 1
+    }
+
+    /// Two loaded cues on the embedded subtitle at `row`, as an open viewer.
+    fn open_ready_cues(app: &mut InterlaceApp) {
+        let cues = vec![
+            crate::subs::Cue { start_secs: 1.0, end_secs: 2.0, text: "Hello\nthere".into() },
+            crate::subs::Cue { start_secs: 3.0, end_secs: 4.0, text: "Bye".into() },
+        ];
+        app.cues = Some(cues::CueView::ready(PathBuf::from("subs.srt"), 0, cues));
+    }
+
+    /// The cue window renders its rows (with an offset applied) and stays open
+    /// across frames while its stream is in the project.
+    #[test]
+    fn renders_cue_window_for_embedded_subtitle() {
+        let mut app = app_with_demo();
+        let row = push_embedded_sub(&mut app);
+        app.project.as_mut().unwrap().streams[row].offset_secs = 1.5;
+        app.selection.set_single(row);
+        open_ready_cues(&mut app);
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
+        }
+        assert!(app.cues.as_ref().is_some_and(|v| v.open));
+    }
+
+    /// The preview is offered only for a loaded, model-driven project with a
+    /// readable start time.
+    #[test]
+    fn preview_blocker_covers_each_reason() {
+        assert!(InterlaceApp::empty().preview_blocker().is_some(), "no project");
+
+        let mut app = app_with_demo();
+        assert_eq!(app.preview_blocker(), None);
+
+        app.preview_start = "1:75".into();
+        assert!(app.preview_blocker().is_some(), "bad start time");
+        app.preview_start = "12:30".into();
+
+        app.command_edit = Some("ffmpeg -i in.mkv out.mkv".into());
+        assert!(app.preview_blocker().is_some(), "edited command");
+        app.command_edit = None;
+
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.run_state = run_state_from(Ok(rx), None);
+        assert!(app.preview_blocker().is_some(), "a run in progress");
+    }
+
+    /// Deleting the embedded track the viewer shows drops the viewer with it.
+    #[test]
+    fn cue_view_dropped_when_its_stream_is_deleted() {
+        let mut app = app_with_demo();
+        let row = push_embedded_sub(&mut app);
+        open_ready_cues(&mut app);
+        app.selection.set_single(row);
+        app.remove_selected();
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
+        assert!(app.cues.is_none());
+    }
+
+    /// An image-based subtitle selected renders the inspector's disabled
+    /// "view cues…" row without panicking.
+    #[test]
+    fn renders_bitmap_subtitle_selection() {
+        let mut app = app_with_demo();
+        app.project.as_mut().unwrap().streams[2].source.codec = "hdmv_pgs_subtitle".into();
+        app.selection.set_single(2);
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
 
     /// Removing a mixed selection soft-removes the originals, hard-deletes the

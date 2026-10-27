@@ -9,8 +9,13 @@
 //! track into the current project (see `InterlaceApp::embed_file`). Files can
 //! also be dropped onto the window, which takes the same two paths
 //! (`InterlaceApp::open_dropped`).
+//!
+//! Under Run sits the preview row: a start time and clip length, and a button
+//! that renders that stretch of the output and opens it in the default player
+//! (`InterlaceApp::start_preview`, `preview.rs`).
 
 use super::{InterlaceApp, RunState, card, pick_media_file, pick_track_file};
+use crate::preview;
 
 pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     let mut open_requested = false;
@@ -92,6 +97,10 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
         // primary action stays with the file it acts on.
         ui.add_space(6.0);
         run_row(ui, app);
+        if app.project.is_some() {
+            ui.add_space(4.0);
+            preview_row(ui, app);
+        }
     });
 
     if toggle_settings {
@@ -145,6 +154,53 @@ fn run_row(ui: &mut egui::Ui, app: &mut InterlaceApp) {
 
     if run_clicked {
         app.on_run_clicked();
+    }
+}
+
+/// The preview controls under the Run row: start time, clip length, and the
+/// button that renders the clip and opens it in the default player. Shares the
+/// progress bar above with Run, since only one ffmpeg job runs at a time.
+fn preview_row(ui: &mut egui::Ui, app: &mut InterlaceApp) {
+    let mut preview_clicked = false;
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("preview from")
+                .small()
+                .color(egui::Color32::from_gray(150)),
+        );
+        let valid = preview::parse_timestamp(&app.preview_start).is_some();
+        let mut edit = egui::TextEdit::singleline(&mut app.preview_start)
+            .desired_width(96.0)
+            .hint_text("00:12:30");
+        if !valid {
+            edit = edit.text_color(egui::Color32::from_rgb(220, 80, 80));
+        }
+        ui.add(edit)
+            .on_hover_text("Start time in the output: hh:mm:ss, mm:ss or seconds. Clicking a subtitle cue sets it.");
+
+        egui::ComboBox::from_id_salt("preview_len")
+            .width(64.0)
+            .selected_text(format!("{} s", app.preview_len))
+            .show_ui(ui, |ui| {
+                for len in preview::LENGTHS {
+                    ui.selectable_value(&mut app.preview_len, len, format!("{len} s"));
+                }
+            });
+
+        let blocker = app.preview_blocker();
+        let resp = ui.add_enabled(blocker.is_none(), egui::Button::new("▶ preview clip"));
+        let resp = match blocker {
+            Some(why) => resp.on_disabled_hover_text(why),
+            None => resp.on_hover_text(
+                "Render this stretch of the output to a temp file and open it in your player. \
+                 A selected audio or subtitle track is the only one of its kind in the clip \
+                 (with none selected, a track with a sync offset is).",
+            ),
+        };
+        preview_clicked = resp.clicked();
+    });
+    if preview_clicked {
+        app.start_preview();
     }
 }
 
