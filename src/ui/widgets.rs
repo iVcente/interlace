@@ -89,6 +89,36 @@ pub(super) fn line(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui
     ui.add(egui::Label::new(text).truncate())
 }
 
+/// A spinning notched ring (the `CIRCLE_NOTCH` look), `size` px square, in
+/// `ACCENT`. It keeps the frame loop running while it's on screen.
+///
+/// Painted as an arc rather than by rotating the glyph: a glyph's ink isn't
+/// centered in its text box and text snaps to whole pixels, so a rotated
+/// glyph wobbles about its center. The arc is centered by construction.
+pub(super) fn spinner(ui: &mut egui::Ui, size: f32) {
+    use std::f32::consts::TAU;
+    let (rect, _) = ui.allocate_exact_size(vec2(size, size), egui::Sense::hover());
+    let width = (size * 0.11).max(1.5);
+    let radius = size / 2.0 - width / 2.0;
+    let center = rect.center();
+    let start = ui.input(|i| i.time) as f32 * TAU;
+    // A three-quarter ring, like the glyph's notch.
+    let sweep = 0.75 * TAU;
+    let n = 48;
+    let points: Vec<egui::Pos2> = (0..=n)
+        .map(|k| {
+            let a = start + sweep * k as f32 / n as f32;
+            center + radius * vec2(a.cos(), a.sin())
+        })
+        .collect();
+    let painter = ui.painter();
+    // Round caps: a line path has square ends, so dot each end.
+    painter.circle_filled(points[0], width / 2.0, theme::ACCENT);
+    painter.circle_filled(points[n], width / 2.0, theme::ACCENT);
+    painter.add(egui::Shape::line(points, Stroke::new(width, theme::ACCENT)));
+    ui.ctx().request_repaint();
+}
+
 /// `icon` then `text`, with the 5 px gap the buttons use.
 pub(super) fn with_icon(glyph: &str, text: &str) -> String {
     if text.is_empty() { glyph.to_string() } else { format!("{glyph} {text}") }

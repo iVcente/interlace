@@ -409,22 +409,10 @@ fn no_match(ui: &mut Ui, filter: &str) -> bool {
 fn loading(ui: &mut Ui) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), egui::Sense::hover());
-        let angle = ui.input(|i| i.time) as f32 * std::f32::consts::TAU;
-        let galley = ui
-            .painter()
-            .layout_no_wrap(icon::CIRCLE_NOTCH.to_string(), egui::FontId::proportional(16.0), theme::ACCENT);
-        // TextShape rotates about its top-left corner, so offset the corner by
-        // the rotated half-size to spin the glyph about its center.
-        let half = galley.size() / 2.0;
-        let rot = egui::emath::Rot2::from_angle(angle);
-        let pos = rect.center() - rot * half;
-        ui.painter()
-            .add(egui::epaint::TextShape::new(pos, galley, theme::ACCENT).with_angle(angle));
+        widgets::spinner(ui, 16.0);
         ui.label("Reading subtitles…");
     });
     widgets::helper(ui, "ffmpeg reads the whole file once, usually 1–10 s. Reopening this track is instant.");
-    ui.ctx().request_repaint();
 }
 
 /// The failed state: the reason in an error box, and Retry. Returns whether

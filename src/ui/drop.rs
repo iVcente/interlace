@@ -79,8 +79,9 @@ pub(crate) struct DropPlan {
 }
 
 impl DropPlan {
-    /// Plan a drop of `paths` given whether a file is open and a job is running.
-    pub(crate) fn new(paths: Vec<PathBuf>, project_open: bool, running: bool) -> Self {
+    /// Plan a drop of `paths` given whether a file is open, and why the app
+    /// can't take a drop right now (a run, or a load in flight), if it can't.
+    pub(crate) fn new(paths: Vec<PathBuf>, project_open: bool, busy: Option<&'static str>) -> Self {
         let mut video = None;
         let mut tracks = Vec::new();
         let mut files = Vec::new();
@@ -100,8 +101,8 @@ impl DropPlan {
             };
             files.push((path, kind, skipped));
         }
-        let action = if running {
-            DropAction::Refused("Wait for the run to finish")
+        let action = if let Some(why) = busy {
+            DropAction::Refused(why)
         } else {
             match (&video, tracks.len()) {
                 (None, 0) => DropAction::Refused("Nothing here to open or insert"),
@@ -138,13 +139,24 @@ pub(crate) fn edit_count(project: &Project) -> usize {
 }
 
 impl InterlaceApp {
+    /// Why a drop can't be taken right now, or `None` when it can.
+    pub(crate) fn drop_blocker(&self) -> Option<&'static str> {
+        if self.run_state.is_running() {
+            Some("Wait for the run to finish")
+        } else if self.loading.is_some() {
+            Some("Wait for the file to load")
+        } else {
+            None
+        }
+    }
+
     /// Act on files released over the window: run the plan, or hold it for
     /// confirmation when it would discard edits.
     pub(crate) fn open_dropped(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             return;
         }
-        let plan = DropPlan::new(paths, self.project.is_some(), self.run_state.is_running());
+        let plan = DropPlan::new(paths, self.project.is_some(), self.drop_blocker());
         if matches!(plan.action, DropAction::Refused(_)) {
             return;
         }
@@ -156,52 +168,10 @@ impl InterlaceApp {
         }
     }
 
-    /// Execute `plan` as one undo step: load the video (if any), then insert
-    /// each track after the last stream of its kind, selecting the first new
-    /// row. Failures are collected rather than stopping at the first.
+    /// Execute `plan` as one undo step: probe its files on a worker thread, then
+    /// open the video (if any) and insert each track (`load::apply_load`).
     pub(crate) fn run_drop(&mut self, plan: DropPlan) {
-        let before = self.snapshot();
-        let mut errors = Vec::new();
-        if let Some(video) = &plan.video {
-            self.load_file(video.clone());
-            if let Some(e) = self.error.take() {
-                // The old project is still there; inserting into it would
-                // surprise more than help.
-                self.error = Some(e);
-                return;
-            }
-        }
-        let mut added = Vec::new();
-        for track in &plan.tracks {
-            self.embed_file(track.clone());
-            match self.error.take() {
-                Some(e) => errors.push(e),
-                None => added.push(track.clone()),
-            }
-        }
-        // Inserting shifts rows, so find the first new one by its file.
-        let first = self.project.as_ref().and_then(|p| {
-            let path = added.first()?;
-            p.streams.iter().position(|s| &p.inputs[s.source.input].path == path)
-        });
-        if let Some(row) = first {
-            self.selection.set_single(row);
-        }
-        self.error = (!errors.is_empty()).then(|| errors.join("\n"));
-
-        let name = |p: &Path| super::file_name_lossy(p).unwrap_or_else(|| p.display().to_string());
-        let text = match (&plan.video, added.as_slice(), first) {
-            (Some(v), [], _) if plan.replaces() => format!("Replaced the main file with {}", name(v)),
-            (Some(v), [], _) => format!("Opened {}", name(v)),
-            (Some(v), tracks, _) => format!("Opened {} and added {} track{}", name(v), tracks.len(), plural(tracks.len())),
-            (None, [one], Some(row)) => {
-                let id = self.project.as_ref().map(|p| stream_id(p, row)).unwrap_or_default();
-                format!("Added {id} from {}", name(one))
-            }
-            (None, tracks, _) if !tracks.is_empty() => format!("Added {} tracks", tracks.len()),
-            _ => return, // nothing changed
-        };
-        self.push_undo(before, text);
+        self.start_load(super::load::LoadRequest { video: plan.video, tracks: plan.tracks, undoable: true });
     }
 
     /// The confirmation for a drop that replaces a file with edits.
@@ -274,7 +244,7 @@ pub(super) fn overlay(ctx: &egui::Context, app: &InterlaceApp) {
     if count == 0 {
         return;
     }
-    let plan = DropPlan::new(hovered, app.project.is_some(), app.run_state.is_running());
+    let plan = DropPlan::new(hovered, app.project.is_some(), app.drop_blocker());
     // Cover the main column (where the table or the empty drop zone is), not
     // the whole window, so the drop reads as landing in the table.
     let area = if app.drop_area.is_positive() { app.drop_area } else { ctx.content_rect() };
@@ -476,7 +446,7 @@ mod tests {
     use super::*;
 
     fn plan(files: &[&str], open: bool) -> DropPlan {
-        DropPlan::new(files.iter().map(PathBuf::from).collect(), open, false)
+        DropPlan::new(files.iter().map(PathBuf::from).collect(), open, None)
     }
 
     #[test]
@@ -499,7 +469,7 @@ mod tests {
             DropAction::OpenThenInsert { replace: true, n: 2 }
         );
         assert!(matches!(plan(&["notes.txt"], true).action, DropAction::Refused(_)));
-        let running = DropPlan::new(vec![PathBuf::from("m.mkv")], false, true);
+        let running = DropPlan::new(vec![PathBuf::from("m.mkv")], false, Some("Wait for the run to finish"));
         assert_eq!(running.action, DropAction::Refused("Wait for the run to finish"));
     }
 

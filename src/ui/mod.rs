@@ -20,8 +20,10 @@
 //! once. Single-stream-only actions (extract, sync offset) need exactly one.
 //!
 //! Media enters through the sources-card pickers or by dropping files onto the
-//! window (`drop`), which plans one action per drop and reuses the picker paths
-//! (`load_file` / `embed_file`). Drops and source removals are undoable (`undo`).
+//! window (`drop`), which plans one action per drop. Either way the files are
+//! probed on a worker thread and applied when it's done (`load`), with an
+//! overlay if that takes a moment. Drops and source removals are undoable
+//! (`undo`).
 //!
 //! Run and Preview share one ffmpeg slot (`run_state`): each disables the other,
 //! and the run card reports whichever is active or just finished.
@@ -30,6 +32,7 @@ mod command;
 mod cues;
 mod drop;
 mod inspector;
+mod load;
 mod runbar;
 mod selection;
 mod sources;
@@ -178,8 +181,11 @@ pub struct InterlaceApp {
     pub(crate) undo: Vec<undo::Snapshot>,
     /// The toast announcing the last undoable change.
     pub(crate) toast: Option<undo::Toast>,
-    /// The main column's area as of this frame, which the drop overlay covers.
+    /// The main column's area as of this frame, which the drop and loading
+    /// overlays cover.
     pub(crate) drop_area: egui::Rect,
+    /// Files being probed on a worker thread (`load`); `None` when idle.
+    pub(crate) loading: Option<load::Loading>,
 }
 
 impl InterlaceApp {
@@ -221,6 +227,7 @@ impl InterlaceApp {
             undo: Vec::new(),
             toast: None,
             drop_area: egui::Rect::NOTHING,
+            loading: None,
         }
     }
 
@@ -241,39 +248,33 @@ impl InterlaceApp {
     }
 
     /// Probe `path` and make it the current project, selecting the first stream.
+    /// The probe runs on a worker thread (`load`), so this returns at once.
     pub fn load_file(&mut self, path: PathBuf) {
-        match Project::from_input(&self.ffprobe, &path) {
-            Ok(project) => {
-                self.selection.clear();
-                if !project.streams.is_empty() {
-                    self.selection.set_single(0);
-                }
-                self.project = Some(project);
-                self.error = None;
-                self.run_state = RunState::Idle;
-                self.command_edit = None; // a new file starts from the model
-                self.cues = None;
-            }
-            Err(e) => self.error = Some(e),
+        self.start_load(load::LoadRequest { video: Some(path), tracks: Vec::new(), undoable: false });
+    }
+
+    /// Make `project` the current one, selecting its first stream: the second
+    /// half of `load_file`, once the probe is back.
+    fn open_project(&mut self, project: Project) {
+        self.selection.clear();
+        if !project.streams.is_empty() {
+            self.selection.set_single(0);
         }
+        self.project = Some(project);
+        self.error = None;
+        self.run_state = RunState::Idle;
+        self.command_edit = None; // a new file starts from the model
+        self.cues = None;
     }
 
     /// Embed an external audio/subtitle track from `path` as a new input of the
-    /// current project, selecting it. With no project loaded there's nothing to
-    /// embed into, so we treat it as opening a primary file instead. A hand-edited
-    /// command is left untouched (the model diverging from it is expected).
+    /// current project, selecting it, once a worker thread has probed it. With
+    /// no project loaded there's nothing to embed into, so we treat it as
+    /// opening a primary file instead. A hand-edited command is left untouched
+    /// (the model diverging from it is expected).
     pub fn embed_file(&mut self, path: PathBuf) {
-        let Some(project) = self.project.as_mut() else {
-            self.load_file(path);
-            return;
-        };
-        match project.append_input(&self.ffprobe, &path) {
-            Ok(i) => {
-                self.selection.set_single(i);
-                self.error = None;
-            }
-            Err(e) => self.error = Some(e),
-        }
+        let (video, tracks) = if self.project.is_some() { (None, vec![path]) } else { (Some(path), Vec::new()) };
+        self.start_load(load::LoadRequest { video, tracks, undoable: false });
     }
 
     /// Remove input `k` (a source chip's ×), as one undo step. The main file (0)
@@ -383,7 +384,9 @@ impl InterlaceApp {
 
     /// Why Run can't start right now, or `None` when it can.
     pub(crate) fn run_blocker(&self) -> Option<&'static str> {
-        if self.project.is_none() && self.command_edit.is_none() {
+        if self.loading.is_some() {
+            Some("Wait for the file to load")
+        } else if self.project.is_none() && self.command_edit.is_none() {
             Some("Open a file first")
         } else if self.ffmpeg_status.is_err() {
             Some("ffmpeg wasn't found; set its path in Settings")
@@ -464,7 +467,9 @@ impl InterlaceApp {
     /// Why a preview can't start right now, or `None` when it can. Drives both
     /// the button's enabled state and the run card's info line.
     pub(crate) fn preview_blocker(&self) -> Option<&'static str> {
-        if self.project.is_none() {
+        if self.loading.is_some() {
+            Some("Wait for the file to load")
+        } else if self.project.is_none() {
             Some("Open a file first")
         } else if self.run_state.is_running() {
             Some("Wait for the run to finish")
@@ -559,6 +564,7 @@ impl InterlaceApp {
     /// so it can be driven headlessly in tests via `Context::run_ui`.
     fn render(&mut self, ui: &mut egui::Ui) {
         self.poll_run(ui.ctx());
+        load::poll(ui.ctx(), self);
         cues::poll(ui.ctx(), self);
 
         // Files dropped onto the window this frame. Entries without a path (web
@@ -694,6 +700,7 @@ impl InterlaceApp {
         self.replace_modal(ui.ctx());
         undo::shortcut(ui.ctx(), self);
         undo::toast(ui.ctx(), self, runbar_top);
+        load::overlay(ui.ctx(), self);
         drop::overlay(ui.ctx(), self);
     }
 
@@ -830,6 +837,7 @@ impl InterlaceApp {
 /// Windows and is left for the next startup sweep (`preview::sweep_temp`).
 impl Drop for InterlaceApp {
     fn drop(&mut self) {
+        self.cancel_load(); // no ffprobe outlives the window
         for clip in &self.preview_clips {
             let _ = std::fs::remove_file(clip);
         }
