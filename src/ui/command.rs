@@ -1,101 +1,94 @@
-//! The compatibility findings and the editable command bar. The findings stay in
-//! the central column (`show_issues`), while the command bar (`show_command`)
-//! lives in a resizable bottom panel toggled by the ⌨ button in the sources bar.
-//! (The Run button and progress bar live in the top `sources` bar, alongside the
-//! source file.)
+//! The command card: the ffmpeg command line, in a resizable card under the
+//! table, toggled by the terminal button in the sources card.
 //!
-//! The command bar mirrors `Project::to_args()` live *until the user edits it* —
-//! then it becomes an escape hatch: `InterlaceApp::command_edit` holds the edited
-//! text, a "diverges from model" indicator appears, and Run executes that text
-//! verbatim (see `run::run_raw`). "Reset to model" drops back to the live view.
-//!
-//! Above the bar we surface rule-based container/codec compatibility issues from
-//! `validate` — but only while following the model, since an edited command is
-//! the user's own business.
+//! It mirrors `Project::to_args()` live *until the user edits it* — then it
+//! becomes an escape hatch: `InterlaceApp::command_edit` holds the edited text,
+//! an amber "Edited" marker appears (and the box outline turns amber), and Run
+//! executes that text verbatim (see `run::run_raw`). Reset drops back to the
+//! live view. The validation hints under the table hide while it's edited,
+//! since they describe the table, not the edited text.
 
-use super::{InterlaceApp, card, section_label};
-use crate::validate::{self, Issue, Severity};
+use super::widgets::{self, section_label};
+use super::{InterlaceApp, theme};
+use egui::{Margin, RichText, Stroke, vec2};
+use egui_phosphor::regular as icon;
 
-/// The compatibility findings, which stay in the central column so they remain
-/// visible even when the command panel is toggled off.
-pub(super) fn show_issues(ui: &mut egui::Ui, app: &mut InterlaceApp) {
-    // Compatibility findings apply to the model, so hide them once edited.
-    if app.command_edit.is_none() && let Some(project) = &app.project {
-        let issues = validate::validate(project);
-        if !issues.is_empty() {
-            issues_card(ui, &issues);
-        }
-    }
-}
-
-/// The editable command bar, rendered into the resizable bottom panel.
+/// The command card, filling the resizable bottom panel it's drawn into.
 pub(super) fn show_command(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     let edited = app.command_edit.is_some();
+    // The edited buffer if the user has taken the escape hatch, otherwise the
+    // live model command — recomputed each frame so it tracks edits made
+    // elsewhere. When edited we don't build the model command at all: it isn't
+    // shown, and `to_args()` allocates the whole arg vector every frame.
+    let mut text = match &app.command_edit {
+        Some(edited) => edited.clone(),
+        None => match &app.project {
+            // Quoted so an edit round-trips through `run::tokenize`.
+            Some(p) => format!("ffmpeg {}", crate::run::join_args(&p.to_args())),
+            None => String::new(),
+        },
+    };
+    let mut reset = false;
+    let mut copy = false;
+    let height = ui.available_height();
 
-    card(ui, |ui| {
+    widgets::card_fill(ui, height, Margin::symmetric(10, 8), |ui| {
+        ui.spacing_mut().item_spacing.y = 6.0;
         ui.horizontal(|ui| {
+            ui.set_min_height(24.0);
             section_label(ui, "COMMAND");
             if edited {
-                ui.label(
-                    egui::RichText::new("✎ edited — diverges from model")
-                        .small()
-                        .color(egui::Color32::from_rgb(217, 119, 6)),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Reset to model").clicked() {
-                        app.command_edit = None;
-                    }
-                });
+                ui.add_space(4.0);
+                let (dot, _) = ui.allocate_exact_size(vec2(7.0, 7.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 3.5, theme::WARNING);
+                widgets::line(ui, RichText::new("Edited. No longer matches the table.").size(12.0).color(theme::WARNING));
             }
-        });
-        ui.add_space(4.0);
-
-        // The edited buffer if the user has taken the escape hatch, otherwise the
-        // live model command — recomputed each frame so it tracks edits made
-        // elsewhere. When edited we don't build the model command at all: it isn't
-        // shown, and `to_args()` allocates the whole arg vector every frame.
-        let mut text = match &app.command_edit {
-            Some(edited) => edited.clone(),
-            None => match &app.project {
-                // Quoted so an edit round-trips through `run::tokenize`.
-                Some(p) => format!("ffmpeg {}", crate::run::join_args(&p.to_args())),
-                None => String::new(),
-            },
-        };
-        let response = ui.add(
-            egui::TextEdit::multiline(&mut text)
-                .font(egui::TextStyle::Monospace)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY),
-        );
-        if response.changed() {
-            // First keystroke takes the escape hatch; further edits update it.
-            app.command_edit = Some(text);
-        }
-    });
-}
-
-/// A card listing compatibility findings, errors (red) before warnings (amber).
-fn issues_card(ui: &mut egui::Ui, issues: &[Issue]) {
-    card(ui, |ui| {
-        section_label(ui, "COMPATIBILITY");
-        ui.add_space(4.0);
-        for issue in issues {
-            let (icon, color) = match issue.severity {
-                Severity::Error => ("⛔", egui::Color32::from_rgb(220, 80, 80)),
-                Severity::Warning => ("⚠", egui::Color32::from_rgb(217, 119, 6)),
-            };
-            let where_ = issue.stream.map(|i| format!("stream {i}: ")).unwrap_or_default();
-            ui.horizontal_wrapped(|ui| {
-                ui.colored_label(color, format!("{icon} {where_}{}", issue.message));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().button_padding = vec2(8.0, 2.0);
+                let small = |glyph, label| widgets::button(RichText::new(widgets::with_icon(glyph, label)).size(12.0));
+                copy = ui.add(small(icon::COPY, "Copy")).on_hover_text("Copy the command").clicked();
+                if edited {
+                    reset = ui
+                        .add(small(icon::ARROW_COUNTER_CLOCKWISE, "Reset"))
+                        .on_hover_text("Go back to the command the table builds")
+                        .clicked();
+                }
             });
-            if let Some(suggestion) = &issue.suggestion {
-                ui.horizontal_wrapped(|ui| {
-                    ui.add_space(18.0);
-                    ui.weak(format!("→ {suggestion}"));
-                });
-            }
-            ui.add_space(2.0);
-        }
+        });
+
+        let stroke = if edited { theme::WARNING } else { theme::STROKE };
+        egui::Frame::NONE
+            .fill(theme::FIELD)
+            .stroke(Stroke::new(1.0, stroke))
+            .corner_radius(6)
+            .inner_margin(Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                let size = ui.available_size();
+                egui::ScrollArea::vertical()
+                    .id_salt("command_scroll")
+                    .auto_shrink([false, false])
+                    .max_height(size.y)
+                    .show(ui, |ui| {
+                        let response = ui.add_sized(
+                            vec2(size.x, (size.y - 2.0).max(20.0)),
+                            egui::TextEdit::multiline(&mut text)
+                                .frame(egui::Frame::NONE)
+                                .font(egui::FontId::monospace(12.5))
+                                .text_color(theme::CODE)
+                                .margin(Margin::ZERO),
+                        );
+                        if response.changed() {
+                            // First keystroke takes the escape hatch; further edits update it.
+                            app.command_edit = Some(text.clone());
+                        }
+                    });
+            });
     });
+
+    if copy {
+        ui.ctx().copy_text(text);
+    }
+    if reset {
+        app.command_edit = None;
+    }
 }

@@ -1,89 +1,104 @@
-//! The top bar: one chip per loaded input file, the "add file" / "add track",
-//! command-panel (⌨) and settings (⚙) buttons on the right, and — on the row
-//! below — the Run button and progress bar so the primary action sits with the
-//! source, not at the bottom of the page.
+//! The sources card at the top: one chip per loaded input, the `+ Audio` /
+//! `+ Subtitle` buttons, the command-panel and settings toggles, and (once a
+//! file is open) the container TITLE field on a second row.
 //!
-//! "+ add file" opens a picker and loads it as the primary project (replacing any
-//! current one). "+ add track" — shown only once a file is loaded — appends an
-//! external audio or subtitle file as an additional input, embedding its single
-//! track into the current project (see `InterlaceApp::embed_file`). Files can
-//! also be dropped onto the window, which takes the same two paths
-//! (`InterlaceApp::open_dropped`).
+//! `+ Audio` and `+ Subtitle` insert an external file of that kind as an
+//! additional input, embedding its single track into the current project (see
+//! `InterlaceApp::embed_file`); they're disabled until a file is open. There's
+//! no button for opening the video itself: that's the empty table's
+//! `Add file…`, or a drop, which also covers replacing it.
 //!
-//! Under Run sits the preview row: a start time and clip length, and a button
-//! that renders that stretch of the output and opens it in the default player
-//! (`InterlaceApp::start_preview`, `preview.rs`).
+//! The buttons are laid out first, from the right, and the chips get whatever
+//! width is left in a horizontal scroll strip. So a long file name can only
+//! truncate its chip; it can never push a button off the row or widen the window.
 
-use super::{InterlaceApp, RunState, card, pick_media_file, pick_track_file};
-use crate::preview;
+use super::widgets;
+use super::{InterlaceApp, pick_audio_file, pick_subtitle_file, theme};
+use egui::{CornerRadius, Margin, RichText, Stroke, vec2};
+use egui_phosphor::regular as icon;
 
-pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
-    let mut open_requested = false;
-    let mut embed_requested = false;
+/// Label column width for the TITLE row.
+const LABEL_WIDTH: f32 = 60.0;
+
+pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp, wide: bool) {
+    let mut audio_requested = false;
+    let mut subtitle_requested = false;
     let mut toggle_settings = false;
     let mut toggle_command = false;
+    let mut remove_input: Option<usize> = None;
+    let busy = app.run_state.is_running();
 
-    card(ui, |ui| {
+    widgets::card(ui, Margin::symmetric(12, 8), |ui| {
+        ui.spacing_mut().item_spacing.y = 8.0;
         ui.horizontal(|ui| {
-            // Pin the action buttons to the right *first*, so they always keep
-            // their space; the source chips then truncate into whatever width is
-            // left. (Laying the chips out first let a long file name shove the
-            // buttons off the row and push the central column wider than the
-            // window, which in turn stranded the inspector's resize handle.)
+            ui.set_min_height(28.0);
+            ui.add_sized(vec2(LABEL_WIDTH - 6.0, 20.0), egui::Label::new(widgets::caps("SOURCES", theme::WEAK)).selectable(false));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("⚙").on_hover_text("Binaries / settings").clicked() {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let size = vec2(28.0, 26.0);
+                if widgets::icon_button(ui, icon::GEAR_SIX, size, app.show_settings, "Settings").clicked() {
                     toggle_settings = true;
                 }
-                if ui
-                    .selectable_label(app.show_command, "⌨")
-                    .on_hover_text("Toggle command panel")
+                if widgets::icon_button(ui, icon::TERMINAL_WINDOW, size, app.show_command, "Show the ffmpeg command")
                     .clicked()
                 {
                     toggle_command = true;
                 }
-                if ui.button("+ add file").clicked() {
-                    open_requested = true;
-                }
-                // Embedding needs something to embed into.
-                if app.project.is_some()
-                    && ui
-                        .button("+ add track")
-                        .on_hover_text("Embed an external audio or subtitle track")
-                        .clicked()
-                {
-                    embed_requested = true;
-                }
+                // A 1×18 divider between the toggles and the add buttons.
+                let (rect, _) = ui.allocate_exact_size(vec2(1.0, 18.0), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 0.0, theme::STROKE);
 
-                // The chips fill the space left of the buttons, each truncating
-                // to fit rather than widening the row.
+                // Laid out right to left, so `+ Subtitle` goes in first.
+                let can_insert = app.project.is_some() && !busy;
+                subtitle_requested = ui
+                    .add_enabled(can_insert, widgets::button(widgets::with_icon(icon::PLUS, "Subtitle")))
+                    .on_hover_text("Insert a subtitle file as a track")
+                    .clicked();
+                audio_requested = ui
+                    .add_enabled(can_insert, widgets::button(widgets::with_icon(icon::PLUS, "Audio")))
+                    .on_hover_text("Insert an audio file as a track")
+                    .clicked();
+
+                // The chips take the width left of the buttons.
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    if let Some(project) = &app.project {
-                        for input in &project.inputs {
-                            let name = super::file_name_lossy(&input.path)
-                                .unwrap_or_else(|| input.path.display().to_string());
-                            chip(ui, &name);
+                    match &app.project {
+                        Some(project) => {
+                            egui::ScrollArea::horizontal()
+                                .id_salt("source_chips")
+                                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        let max = if wide { 420.0 } else { 250.0 };
+                                        for (k, input) in project.inputs.iter().enumerate() {
+                                            let name = super::file_name_lossy(&input.path)
+                                                .unwrap_or_else(|| input.path.display().to_string());
+                                            if chip(ui, k, &name, max, !busy) {
+                                                remove_input = Some(k);
+                                            }
+                                        }
+                                    });
+                                });
+                        }
+                        None => {
+                            ui.label("No input yet");
                         }
                     }
                 });
             });
         });
 
-        // The container title (whole-file metadata) sits under the source chips,
-        // once a file is loaded. Empty clears it back to `None`, so an untouched
-        // title round-trips through the copy unchanged.
+        // The container title (whole-file metadata). Empty clears it back to
+        // `None`, so an untouched title round-trips through the copy unchanged.
         if let Some(project) = app.project.as_mut() {
-            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("title")
-                        .small()
-                        .color(egui::Color32::from_gray(150)),
-                );
+                ui.add_sized(vec2(LABEL_WIDTH - 6.0, 20.0), egui::Label::new(widgets::caps("TITLE", theme::WEAK)).selectable(false));
                 let mut title = project.title.clone().unwrap_or_default();
                 let resp = ui
                     .add(
                         egui::TextEdit::singleline(&mut title)
-                            .hint_text("file title")
+                            .hint_text("File title")
+                            .margin(Margin::symmetric(8, 4))
                             .desired_width(f32::INFINITY),
                     )
                     .on_hover_text("Sets the output container's title metadata");
@@ -91,15 +106,6 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
                     project.title = (!title.is_empty()).then_some(title);
                 }
             });
-        }
-
-        // The Run button and progress bar live right under the source, so the
-        // primary action stays with the file it acts on.
-        ui.add_space(6.0);
-        run_row(ui, app);
-        if app.project.is_some() {
-            ui.add_space(4.0);
-            preview_row(ui, app);
         }
     });
 
@@ -109,125 +115,61 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut InterlaceApp) {
     if toggle_command {
         app.show_command = !app.show_command;
     }
-    // Run the (blocking) native dialogs after the borrow of `app` ends.
-    if open_requested && let Some(path) = pick_media_file() {
-        app.load_file(path);
+    if let Some(k) = remove_input {
+        app.remove_input(k);
     }
-    if embed_requested && let Some(path) = pick_track_file() {
+    // Run the (blocking) native dialogs after the borrow of `app` ends.
+    if audio_requested && let Some(path) = pick_audio_file() {
+        app.embed_file(path);
+    }
+    if subtitle_requested && let Some(path) = pick_subtitle_file() {
         app.embed_file(path);
     }
 }
 
-/// The Run button and its progress bar, sitting under the source chips.
-fn run_row(ui: &mut egui::Ui, app: &mut InterlaceApp) {
-    let mut run_clicked = false;
-
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let running = matches!(app.run_state, RunState::Running { .. });
-            // With an edited command we can run even before a file is loaded.
-            let have_command = app.project.is_some() || app.command_edit.is_some();
-            let enabled = have_command && !running;
-            // No leading glyph on the running label — the ● (U+25CF) isn't in
-            // egui's default fonts and renders as tofu; an animated spinner beside
-            // the button carries the "in progress" cue instead.
-            let label = if running { "running…" } else { "▶ run" };
-            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-                run_clicked = true;
-            }
-            if running {
-                ui.add(egui::Spinner::new());
-            }
-
-            let (fraction, text, color) = progress_view(&app.run_state);
-            if let Some(color) = color {
-                // Surface a finished-run message beside the bar.
-                ui.colored_label(color, &text);
-            }
-            ui.add(
-                egui::ProgressBar::new(fraction)
-                    .desired_width(ui.available_width())
-                    .text(text),
-            );
-        });
-    });
-
-    if run_clicked {
-        app.on_run_clicked();
-    }
-}
-
-/// The preview controls under the Run row: start time, clip length, and the
-/// button that renders the clip and opens it in the default player. Shares the
-/// progress bar above with Run, since only one ffmpeg job runs at a time.
-fn preview_row(ui: &mut egui::Ui, app: &mut InterlaceApp) {
-    let mut preview_clicked = false;
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("preview from")
-                .small()
-                .color(egui::Color32::from_gray(150)),
-        );
-        let valid = preview::parse_timestamp(&app.preview_start).is_some();
-        let mut edit = egui::TextEdit::singleline(&mut app.preview_start)
-            .desired_width(96.0)
-            .hint_text("00:12:30");
-        if !valid {
-            edit = edit.text_color(egui::Color32::from_rgb(220, 80, 80));
-        }
-        ui.add(edit)
-            .on_hover_text("Start time in the output: hh:mm:ss, mm:ss or seconds. Clicking a subtitle cue sets it.");
-
-        egui::ComboBox::from_id_salt("preview_len")
-            .width(64.0)
-            .selected_text(format!("{} s", app.preview_len))
-            .show_ui(ui, |ui| {
-                for len in preview::LENGTHS {
-                    ui.selectable_value(&mut app.preview_len, len, format!("{len} s"));
-                }
-            });
-
-        let blocker = app.preview_blocker();
-        let resp = ui.add_enabled(blocker.is_none(), egui::Button::new("▶ preview clip"));
-        let resp = match blocker {
-            Some(why) => resp.on_disabled_hover_text(why),
-            None => resp.on_hover_text(
-                "Render this stretch of the output to a temp file and open it in your player. \
-                 A selected audio or subtitle track is the only one of its kind in the clip \
-                 (with none selected, a track with a sync offset is).",
-            ),
-        };
-        preview_clicked = resp.clicked();
-    });
-    if preview_clicked {
-        app.start_preview();
-    }
-}
-
-/// Map the run state to (bar fraction, bar text, optional side-message color).
-fn progress_view(state: &RunState) -> (f32, String, Option<egui::Color32>) {
-    match state {
-        RunState::Idle => (0.0, "idle".into(), None),
-        RunState::Running { fraction, line, .. } => (*fraction, line.clone(), None),
-        RunState::Done { ok: true, line } => {
-            (1.0, line.clone(), Some(egui::Color32::from_rgb(80, 200, 120)))
-        }
-        RunState::Done { ok: false, line } => {
-            (0.0, line.clone(), Some(egui::Color32::from_rgb(220, 80, 80)))
-        }
-    }
-}
-
-/// A read-only rounded chip showing a source file. The name truncates with an
-/// ellipsis to fit the width left after the action buttons — so it never widens
-/// the row past the window. A truncated `Label` shows the full text on hover on
-/// its own (`show_tooltip_when_elided`), so we add no extra tooltip here — that
-/// would double it up, and would also show when nothing is elided.
-fn chip(ui: &mut egui::Ui, name: &str) {
-    egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::symmetric(8, 4))
-        .corner_radius(egui::CornerRadius::same(6))
+/// One source chip: the input index badge, the file name (truncated to
+/// `max_width`), and an `x` that removes the input. Returns whether the `x` was
+/// clicked.
+fn chip(ui: &mut egui::Ui, index: usize, name: &str, max_width: f32, removable: bool) -> bool {
+    let mut remove = false;
+    egui::Frame::NONE
+        .fill(theme::CARD)
+        .stroke(Stroke::new(1.0, theme::STROKE))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin { left: 4, right: 6, top: 3, bottom: 3 })
         .show(ui, |ui| {
-            ui.add(egui::Label::new(name).truncate());
+            ui.set_max_width(max_width);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            egui::Frame::NONE
+                .fill(theme::BUTTON_STROKE)
+                .corner_radius(CornerRadius::same(4))
+                .inner_margin(Margin::symmetric(5, 1))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(index.to_string()).font(egui::FontId::monospace(11.0)))
+                            .selectable(false),
+                    );
+                });
+            // The name gets its natural width up to what the cap leaves after the
+            // badge and the `x`; past that it truncates.
+            let natural = ui
+                .painter()
+                .layout_no_wrap(name.to_string(), egui::FontId::proportional(13.0), theme::TEXT)
+                .size()
+                .x;
+            let name_width = natural.min(max_width - 56.0).max(24.0);
+            ui.allocate_ui_with_layout(
+                vec2(name_width, 20.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_max_width(name_width);
+                    widgets::line(ui, name);
+                },
+            );
+            let hover = if index == 0 { "Close this file" } else { "Remove this track file and its streams" };
+            ui.add_enabled_ui(removable, |ui| {
+                remove = widgets::close_x(ui, 16.0, hover);
+            });
         });
+    remove
 }

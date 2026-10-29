@@ -157,7 +157,8 @@ impl Project {
     }
 
     /// Probe `file` and embed its single audio or subtitle track as a new input,
-    /// returning the index of the appended stream (for the UI to select).
+    /// placed after the last stream of its kind (or at the end when there is
+    /// none), returning its index (for the UI to select).
     ///
     /// The embed model is one external track, not a container merge: we take the
     /// lone audio/subtitle stream and ignore any incidental video (cover art) or
@@ -185,9 +186,16 @@ impl Project {
         };
         stream.added = true; // synthetic — hard-deleted, not soft-removed
 
-        let at = self.streams.len();
+        // After the last stream of the same kind, so a new subtitle joins the
+        // subtitles rather than landing after the attachments.
+        let kind = stream.source.kind;
+        let at = self
+            .streams
+            .iter()
+            .rposition(|s| s.source.kind == kind)
+            .map_or(self.streams.len(), |i| i + 1);
         self.inputs.push(Input::new(file.to_path_buf()));
-        self.streams.push(stream);
+        self.streams.insert(at, stream);
         Ok(at)
     }
 }

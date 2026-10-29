@@ -34,11 +34,11 @@ fn main() -> eframe::Result {
     // GUI: optionally preload the first non-flag argument as a file.
     let initial = argv.iter().find(|a| !a.starts_with("--")).map(PathBuf::from);
 
-    // The startup size doubles as the minimum: the layout is tuned for it, so
-    // shrinking below it just clips the stream table and inspector.
+    // The layout is designed at 1000×650 (and widens from 1400 px). Below the
+    // minimum, the table's flexible column and the inspector run out of room.
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([790.0, 720.0])
-        .with_min_inner_size([790.0, 720.0])
+        .with_inner_size([1000.0, 650.0])
+        .with_min_inner_size([880.0, 600.0])
         .with_title("interlace")
         // Files can be dropped onto the window to open them or embed tracks.
         .with_drag_and_drop(true);
@@ -110,7 +110,7 @@ fn cli(argv: &[String]) -> i32 {
 /// Run the project and render progress to the terminal.
 fn execute(ffmpeg: &str, project: &Project) -> i32 {
     let updates = match run::run(ffmpeg, project, true) {
-        Ok(rx) => rx,
+        Ok(handle) => handle.rx,
         Err(e) => {
             eprintln!("error: {e}");
             return 1;

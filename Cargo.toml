@@ -1,6 +1,6 @@
 [package]
 name = "interlace"
-version = "1.1.0"
+version = "2.0.0"
 edition = "2024"
 description = "A focused desktop GUI for remuxing media with ffmpeg -- reorder, tag, remove, extract, and convert streams."
 authors = ["Vicente Danzmann"]
@@ -9,6 +9,8 @@ readme = "README.md"
 [dependencies]
 eframe = "0.35.0"
 egui = "0.35"
+# Phosphor icon font (MIT); 0.13 is the release built against egui 0.35.
+egui-phosphor = "0.13"
 rfd = "0.17.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

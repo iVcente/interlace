@@ -57,14 +57,7 @@ pub fn sweep_temp() {
 /// checking that offset is what a preview is usually for.
 pub fn focused(project: &Project, selected: Option<usize>) -> Project {
     let mut clip = project.clone();
-    let testable = |i: usize| {
-        let s = &clip.streams[i];
-        !s.removed && matches!(s.source.kind, Kind::Audio | Kind::Subtitle)
-    };
-    let focus = selected.filter(|&i| i < clip.streams.len() && testable(i)).or_else(|| {
-        (0..clip.streams.len()).find(|&i| testable(i) && clip.streams[i].has_offset())
-    });
-    let Some(focus) = focus else { return clip };
+    let Some(focus) = focus(project, selected) else { return clip };
 
     let kind = clip.streams[focus].source.kind;
     for (i, s) in clip.streams.iter_mut().enumerate() {
@@ -74,6 +67,19 @@ pub fn focused(project: &Project, selected: Option<usize>) -> Project {
         }
     }
     clip
+}
+
+/// The stream a preview tests: `selected` if it's a live audio/subtitle stream,
+/// otherwise the first such stream with a sync offset. `None` previews every
+/// track as it is. Shared by `focused` and the run card's "Testing …" line.
+pub fn focus(project: &Project, selected: Option<usize>) -> Option<usize> {
+    let testable = |i: usize| {
+        let s = &project.streams[i];
+        !s.removed && matches!(s.source.kind, Kind::Audio | Kind::Subtitle)
+    };
+    selected
+        .filter(|&i| i < project.streams.len() && testable(i))
+        .or_else(|| (0..project.streams.len()).find(|&i| testable(i) && project.streams[i].has_offset()))
 }
 
 /// Parse a start time typed by the user: `ss`, `mm:ss` or `hh:mm:ss`, each with

@@ -1,52 +1,123 @@
 //! The egui/eframe view layer.
 //!
-//! Milestone 4 makes it interactive: the inspector edits write back into the
-//! model, rows drag-to-reorder, remove/convert actions mutate the stream vec,
-//! and the Run button drives `run.rs` with a live progress bar. Extract and an
-//! editable command bar are milestone 5.
-//!
 //! `InterlaceApp` owns the whole session state; each screen region lives in its
-//! own submodule (`sources`, `table`, `inspector`, `command`) and is handed
-//! `&mut InterlaceApp` to render. Shared drawing helpers live here.
+//! own submodule and is handed `&mut InterlaceApp` to render:
+//!
+//! - `sources`: the top card (input chips, + Audio / + Subtitle, panel toggles, title)
+//! - `table`: the stream table card plus the validation hints under it
+//! - `inspector`: the right-hand card editing the selected streams
+//! - `cues`: the subtitle cue card, stacked under the inspector when open
+//! - `command`: the optional, resizable command card under the table
+//! - `runbar`: the bottom card (Run, output path, progress, preview row)
+//!
+//! Layout follows the "floating cards" design: every panel is transparent with
+//! an 8 px gutter as its margin, and draws its own rounded card inside, so cards
+//! never meet at a join. Colors, fonts and widget styles come from `theme`, and
+//! the small shared pieces (buttons, badges, pills…) from `widgets`.
 //!
 //! The table selection is a set (`selection::Selection`), so the inspector and
 //! the remove/restore/convert mutations below work over every selected row at
 //! once. Single-stream-only actions (extract, sync offset) need exactly one.
 //!
-//! Media enters through the sources-bar pickers or by dropping files onto the
-//! window. Drops reuse the picker paths (`load_file` / `embed_file`), routed by
-//! extension against the same `TRACK_EXTENSIONS` list the track picker filters on.
+//! Media enters through the sources-card pickers or by dropping files onto the
+//! window (`drop`), which plans one action per drop and reuses the picker paths
+//! (`load_file` / `embed_file`). Drops and source removals are undoable (`undo`).
 //!
-//! The subtitle cue viewer (`cues`) docks under the inspector in the right-hand
-//! panel, opened from the inspector for one text subtitle stream.
+//! Run and Preview share one ffmpeg slot (`run_state`): each disables the other,
+//! and the run card reports whichever is active or just finished.
 
 mod command;
 mod cues;
+mod drop;
 mod inspector;
+mod runbar;
 mod selection;
 mod sources;
 mod table;
+mod undo;
+pub(crate) mod theme;
+mod widgets;
 
-use crate::model::{Encode, Kind, OutStream, Project};
+use crate::model::{Encode, OutStream, Project};
+use crate::run::{self, RunHandle, RunUpdate};
+use egui::{Frame, Margin, RichText};
+use egui_phosphor::regular as icon;
 use selection::Selection;
-use crate::run::{self, RunUpdate};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
+use std::time::Instant;
 
-/// The state of the current (or last) ffmpeg run.
+/// Window width from which the layout switches to its wide form (split table
+/// columns, a 440 px inspector, the STREAM DETAILS section).
+const WIDE_FROM: f32 = 1400.0;
+
+/// What an ffmpeg job is for, which decides how its end is reported.
+pub(crate) enum JobKind {
+    /// The main remux, an extract or an edited command. `output` is the file it
+    /// writes, when known, for the "Wrote …" line and Show in folder.
+    Run { output: Option<PathBuf> },
+    /// A preview clip, opened in the default player once rendered.
+    Preview { clip: PathBuf, start: f64, len: f64 },
+}
+
+/// One ffmpeg job, running or finished.
+pub(crate) struct Job {
+    pub(crate) kind: JobKind,
+    /// When it was launched, for the elapsed time and the "in 38 s" summary.
+    started: Instant,
+    /// Set by Cancel, so the resulting non-zero exit isn't reported as a failure.
+    cancelled: bool,
+}
+
+impl Job {
+    /// A job of `kind` starting now.
+    fn new(kind: JobKind) -> Self {
+        Self { kind, started: Instant::now(), cancelled: false }
+    }
+
+    /// Whether this is a preview clip rather than a real run.
+    pub(crate) fn is_preview(&self) -> bool {
+        matches!(self.kind, JobKind::Preview { .. })
+    }
+}
+
+/// How a finished job ended.
+pub(crate) enum Outcome {
+    /// A run wrote its output: size (if it could be read) and wall time.
+    Wrote { bytes: Option<u64>, secs: f64 },
+    /// A preview clip rendered and was handed to the default player.
+    PreviewOpened,
+    /// The user pressed Cancel.
+    Cancelled,
+    /// ffmpeg failed or couldn't start. `message` is one line for the run card,
+    /// `log` the stderr tail shown by View log.
+    Failed { message: String, log: String },
+}
+
+/// The state of the shared ffmpeg slot.
 pub(crate) enum RunState {
     Idle,
     Running {
-        rx: Receiver<RunUpdate>,
+        handle: RunHandle,
+        job: Job,
+        /// Completion in `0..=1`, when the duration is known.
         fraction: f32,
-        line: String,
-        /// A preview clip to open in the default player once the run succeeds.
-        open_on_success: Option<PathBuf>,
+        /// Encoding speed as a multiple of realtime, once ffmpeg reports it.
+        speed: Option<f64>,
     },
-    Done {
-        ok: bool,
-        line: String,
-    },
+    Done { job: Job, outcome: Outcome },
+}
+
+impl RunState {
+    /// Whether any job (run or preview) holds the ffmpeg slot.
+    pub(crate) fn is_running(&self) -> bool {
+        matches!(self, RunState::Running { .. })
+    }
+
+    /// Whether a real run (not a preview) is going. Only this locks the inspector.
+    pub(crate) fn is_main_running(&self) -> bool {
+        matches!(self, RunState::Running { job, .. } if !job.is_preview())
+    }
 }
 
 /// The whole application state.
@@ -66,7 +137,7 @@ pub struct InterlaceApp {
     /// executes this text verbatim instead. Reset to `None` on load or "Reset".
     pub(crate) command_edit: Option<String>,
     /// The subtitle cue viewer (`cues.rs`); `None` until one is opened. Kept when
-    /// its window closes so reopening the same stream needn't re-read the file.
+    /// its card closes so reopening the same stream needn't re-read the file.
     pub(crate) cues: Option<cues::CueView>,
     /// The preview clip's start time as typed (`hh:mm:ss`, `mm:ss` or seconds),
     /// in output time. Kept as text so a half-typed value isn't reformatted under
@@ -82,25 +153,47 @@ pub struct InterlaceApp {
     /// legible error). `Ok("")` means "not yet checked" (the test default).
     pub(crate) ffmpeg_status: Result<String, String>,
     pub(crate) ffprobe_status: Result<String, String>,
-    /// Whether the binaries settings panel is expanded.
+    /// Whether the settings window is open.
     pub(crate) show_settings: bool,
-    /// Whether the command bar (a resizable bottom panel) is shown.
+    /// Whether the command card (a resizable panel under the table) is shown.
     pub(crate) show_command: bool,
     /// `show_command` as of the last rendered frame. Adding/removing a panel
     /// doesn't trigger egui's settle-pass the way changing central content does,
     /// so on the frame this differs we force a discard to avoid a one-frame
     /// flash of id-clash outlines while the layout re-settles.
     prev_show_command: bool,
+    /// Whether the View log window (the failed job's stderr) is open.
+    pub(crate) show_log: bool,
+    /// Whether the output path is being typed into, rather than shown as a
+    /// field that keeps the end of the path visible.
+    pub(crate) editing_output: bool,
+    /// When a cue click last set the preview start; the START field flashes
+    /// for a moment after it (see `cues::start_flash`).
+    pub(crate) start_flash: Option<Instant>,
+    /// Cues read this session, so reopening a stream needs no second read.
+    pub(crate) cue_cache: cues::CueCache,
+    /// A drop that replaces an edited file, awaiting confirmation.
+    pub(crate) pending_drop: Option<drop::DropPlan>,
+    /// Snapshots before each drop or source removal, newest last.
+    pub(crate) undo: Vec<undo::Snapshot>,
+    /// The toast announcing the last undoable change.
+    pub(crate) toast: Option<undo::Toast>,
+    /// The main column's area as of this frame, which the drop overlay covers.
+    pub(crate) drop_area: egui::Rect,
 }
 
 impl InterlaceApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    /// The app as eframe starts it: Midnight theme and fonts installed, binaries
+    /// detected, and preview clips from earlier sessions swept.
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        theme::install(&cc.egui_ctx, true);
         let mut app = Self::empty();
         app.recheck_binaries(); // detect ffmpeg/ffprobe up front
         crate::preview::sweep_temp(); // clips left over from earlier sessions
         app
     }
 
+    /// A blank session with nothing probed, as tests build it.
     fn empty() -> Self {
         Self {
             project: None,
@@ -120,6 +213,14 @@ impl InterlaceApp {
             show_settings: false,
             show_command: false,
             prev_show_command: false,
+            show_log: false,
+            editing_output: false,
+            start_flash: None,
+            cue_cache: Default::default(),
+            pending_drop: None,
+            undo: Vec::new(),
+            toast: None,
+            drop_area: egui::Rect::NOTHING,
         }
     }
 
@@ -130,9 +231,13 @@ impl InterlaceApp {
         self.ffprobe_status = run::version(&self.ffprobe);
     }
 
-    /// Both binaries resolved on the last check.
-    pub(crate) fn binaries_ok(&self) -> bool {
-        self.ffmpeg_status.is_ok() && self.ffprobe_status.is_ok()
+    /// The first missing binary as `(name, configured path, error)`, if any.
+    pub(crate) fn missing_binary(&self) -> Option<(&'static str, &str, &str)> {
+        match (&self.ffmpeg_status, &self.ffprobe_status) {
+            (Err(e), _) => Some(("ffmpeg", &self.ffmpeg, e)),
+            (_, Err(e)) => Some(("ffprobe", &self.ffprobe, e)),
+            _ => None,
+        }
     }
 
     /// Probe `path` and make it the current project, selecting the first stream.
@@ -171,33 +276,29 @@ impl InterlaceApp {
         }
     }
 
-    /// Handle files dropped onto the window, routing each through the same path
-    /// as the pickers: a container opens via `load_file`, a track embeds via
-    /// `embed_file` (which itself opens it when no project is loaded yet). Each
-    /// call's error is collected as we go — otherwise a later success clearing
-    /// `error` would hide an earlier failure.
-    pub(crate) fn open_dropped(&mut self, paths: Vec<PathBuf>) {
-        if paths.is_empty() {
-            return;
-        }
-        if matches!(self.run_state, RunState::Running { .. }) {
-            self.error = Some("Can't change sources while a run is in progress.".into());
-            return;
-        }
-        let (ordered, skipped) = order_drops(paths);
-        let mut errors = Vec::new();
-        for path in ordered {
-            if is_track_file(&path) {
-                self.embed_file(path);
-            } else {
-                self.load_file(path);
-            }
-            errors.extend(self.error.take());
-        }
-        for path in skipped {
-            errors.push(format!("{} skipped — only one file can be opened at a time.", path.display()));
-        }
-        self.error = (!errors.is_empty()).then(|| errors.join("\n"));
+    /// Remove input `k` (a source chip's ×), as one undo step. The main file (0)
+    /// closes the whole project; any other input takes every stream it
+    /// contributed with it.
+    pub(crate) fn remove_input(&mut self, k: usize) {
+        let Some(p) = &self.project else { return };
+        let Some(input) = p.inputs.get(k) else { return };
+        let name = file_name_lossy(&input.path).unwrap_or_else(|| input.path.display().to_string());
+        let before = self.snapshot();
+        let text = if k == 0 {
+            self.project = None;
+            self.selection.clear();
+            self.command_edit = None;
+            self.cues = None;
+            format!("Closed {name}")
+        } else {
+            let Some(p) = &mut self.project else { return };
+            let n = p.streams.iter().filter(|s| s.source.input == k).count();
+            p.streams.retain(|s| s.source.input != k);
+            p.prune_orphan_inputs();
+            self.selection.clear();
+            format!("Removed {name} and its {n} stream{}", if n == 1 { "" } else { "s" })
+        };
+        self.push_undo(before, text);
     }
 
     // --- model mutations (called by the table/inspector after rendering) -----
@@ -280,18 +381,40 @@ impl InterlaceApp {
 
     // --- running -------------------------------------------------------------
 
+    /// Why Run can't start right now, or `None` when it can.
+    pub(crate) fn run_blocker(&self) -> Option<&'static str> {
+        if self.project.is_none() && self.command_edit.is_none() {
+            Some("Open a file first")
+        } else if self.ffmpeg_status.is_err() {
+            Some("ffmpeg wasn't found; set its path in Settings")
+        } else if self.run_state.is_running() {
+            Some("Wait for the current job to finish")
+        } else {
+            None
+        }
+    }
+
     /// Called when Run is pressed: confirm overwrite if needed, else start.
     pub(crate) fn on_run_clicked(&mut self) {
+        if self.run_blocker().is_some() {
+            return;
+        }
         // Escape hatch: an edited command runs verbatim, bypassing the model
         // (and thus the model-based overwrite pre-check — the user owns `-y`).
         if let Some(command) = self.command_edit.clone() {
-            if !matches!(self.run_state, RunState::Running { .. }) {
-                self.start_run_edited(&command);
-            }
+            self.start_run_edited(&command);
             return;
         }
         if let Some(p) = self.project.clone() {
             self.begin_run(p);
+        }
+    }
+
+    /// Stop the running job (Run's or Preview's Cancel).
+    pub(crate) fn cancel_job(&mut self) {
+        if let RunState::Running { handle, job, .. } = &mut self.run_state {
+            job.cancelled = true;
+            handle.cancel();
         }
     }
 
@@ -311,7 +434,7 @@ impl InterlaceApp {
 
     /// Start `project`, confirming first if its output already exists.
     fn begin_run(&mut self, project: Project) {
-        if matches!(self.run_state, RunState::Running { .. }) {
+        if self.run_state.is_running() {
             return;
         }
         if project.output.exists() {
@@ -323,30 +446,49 @@ impl InterlaceApp {
 
     /// Run a user-edited command string. Tokenizes it, drops a leading `ffmpeg`
     /// program token (the configured binary is authoritative), and runs the rest.
+    /// The last token is taken as the output when it isn't an option.
     pub(crate) fn start_run_edited(&mut self, command: &str) {
         let args = command_args(command);
+        let output = args.last().filter(|a| !a.starts_with('-')).map(PathBuf::from);
         let duration = self.project.as_ref().and_then(|p| p.duration_secs);
-        self.run_state = run_state_from(run::run_raw(&self.ffmpeg, args, duration), None);
+        let job = Job::new(JobKind::Run { output });
+        self.run_state = run_state_from(run::run_raw(&self.ffmpeg, args, duration), job);
     }
 
+    /// Launch `project` now (`overwrite` once the user confirmed it).
     fn start_run_project(&mut self, project: Project, overwrite: bool) {
-        self.run_state = run_state_from(run::run(&self.ffmpeg, &project, overwrite), None);
+        let job = Job::new(JobKind::Run { output: Some(project.output.clone()) });
+        self.run_state = run_state_from(run::run(&self.ffmpeg, &project, overwrite), job);
     }
 
     /// Why a preview can't start right now, or `None` when it can. Drives both
-    /// the button's enabled state and its hover text.
+    /// the button's enabled state and the run card's info line.
     pub(crate) fn preview_blocker(&self) -> Option<&'static str> {
         if self.project.is_none() {
             Some("Open a file first")
-        } else if matches!(self.run_state, RunState::Running { .. }) {
-            Some("Wait for the current run to finish")
+        } else if self.run_state.is_running() {
+            Some("Wait for the run to finish")
         } else if self.command_edit.is_some() {
-            Some("The preview follows the editor, not the edited command — reset the command first")
+            Some("Preview follows the table, not the edited command. Reset the command first.")
         } else if crate::preview::parse_timestamp(&self.preview_start).is_none() {
             Some("Enter a start time like 00:12:30, 12:30 or 750")
         } else {
             None
         }
+    }
+
+    /// The stream a preview should test: the single selected stream when it's a
+    /// live audio/subtitle track, else the track the cue card shows (so playing
+    /// a cue tests that track even with something else selected). `None` lets
+    /// `preview::focus` fall back to a track with an offset.
+    pub(crate) fn preview_subject(&self) -> Option<usize> {
+        let project = self.project.as_ref()?;
+        let testable = |i: usize| {
+            project.streams.get(i).is_some_and(|s| {
+                !s.removed && matches!(s.source.kind, crate::model::Kind::Audio | crate::model::Kind::Subtitle)
+            })
+        };
+        self.selection.single().filter(|&i| testable(i)).or_else(|| self.cue_row().filter(|&i| testable(i)))
     }
 
     /// Render a `preview_len`-second clip of the current project from
@@ -361,57 +503,54 @@ impl InterlaceApp {
         else {
             return;
         };
-        let clip = crate::preview::focused(project, self.selection.single());
+        let clip = crate::preview::focused(project, self.preview_subject());
         let out = crate::preview::next_path();
         let args = clip.preview_args(start, self.preview_len, &out);
         self.preview_clips.push(out.clone());
         self.error = None;
-        self.run_state = run_state_from(run::run_preview(&self.ffmpeg, args, self.preview_len), Some(out));
+        let job = Job::new(JobKind::Preview { clip: out, start, len: self.preview_len });
+        self.run_state = run_state_from(run::run_preview(&self.ffmpeg, args, self.preview_len), job);
     }
 
-    /// Drain progress updates each frame while a run is active.
+    /// Drain progress updates each frame while a job is active, and settle it
+    /// into a `Done` outcome when it finishes.
     fn poll_run(&mut self, ctx: &egui::Context) {
-        let RunState::Running {
-            rx,
-            fraction,
-            line,
-            open_on_success,
-        } = &mut self.run_state
-        else {
+        let RunState::Running { handle, fraction, speed, .. } = &mut self.run_state else {
             return;
         };
-        let mut finished: Option<(bool, String)> = None;
+        let mut finished: Option<Result<(), run::RunFailure>> = None;
         loop {
-            match rx.try_recv() {
+            match handle.rx.try_recv() {
                 Ok(RunUpdate::Progress(p)) => {
                     if let Some(f) = p.fraction {
                         *fraction = f as f32;
                     }
-                    *line = progress_line(&p);
+                    if p.speed.is_some() {
+                        *speed = p.speed;
+                    }
                 }
                 Ok(RunUpdate::Finished { result }) => {
-                    finished = Some(match (result, open_on_success.as_deref()) {
-                        (Ok(()), None) => (true, "done".into()),
-                        (Ok(()), Some(clip)) => match run::open_in_default_app(clip) {
-                            Ok(()) => (true, "preview opened".into()),
-                            Err(e) => (false, e),
-                        },
-                        (Err(f), _) => (false, failure_line(&f)),
-                    });
+                    finished = Some(result);
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    finished = Some((false, "run ended unexpectedly".into()));
+                    finished = Some(Err(run::RunFailure {
+                        code: None,
+                        stderr_tail: "the run ended unexpectedly".into(),
+                    }));
                     break;
                 }
             }
         }
         // Keep animating while a run is live (egui otherwise sleeps until input).
         ctx.request_repaint();
-        if let Some((ok, line)) = finished {
-            self.run_state = RunState::Done { ok, line };
-        }
+        let Some(result) = finished else { return };
+        let RunState::Running { job, .. } = std::mem::replace(&mut self.run_state, RunState::Idle) else {
+            return;
+        };
+        let outcome = finish(&job, result);
+        self.run_state = RunState::Done { job, outcome };
     }
 
     // --- frame ---------------------------------------------------------------
@@ -434,148 +573,198 @@ impl InterlaceApp {
         });
         self.open_dropped(dropped);
 
+        let wide = ui.ctx().content_rect().width() >= WIDE_FROM;
+        // Each panel's margin is the gutter on the sides it doesn't share with a
+        // neighbor; the neighbor's margin supplies the gap on the shared side.
+        let g = theme::GUTTER as i8;
+        let gutter = |left, top, right, bottom| {
+            Frame::NONE.fill(theme::BG).inner_margin(Margin { left, right, top, bottom })
+        };
+
+        egui::Panel::top("sources")
+            .show_separator_line(false) // the gutter separates the cards
+            .frame(gutter(g, g, g, 0))
+            .show(ui, |ui| sources::show(ui, self, wide));
+
         // Toggling a panel on/off doesn't trigger egui's automatic settle-pass
         // (unlike changing central content), so the first frame after a toggle is
         // laid out unsettled and paints a flash of red id-clash outlines. Force a
         // discard on that frame so egui re-runs the pass cleanly, as it would for
         // any other layout change. `prev_show_command` updates now (state survives
         // the discard) so the re-run pass sees no change and paints normally.
+        // This runs *after* the sources card, whose terminal button flips
+        // `show_command` mid-frame; checked earlier, that click's own frame
+        // would paint the command card unsettled.
         if self.show_command != self.prev_show_command {
             self.prev_show_command = self.show_command;
             ui.ctx().request_discard("command panel toggled");
         }
 
-        // The inspector is a right-hand panel. It's added before the central panel
-        // so egui reserves its width first; the table/command flow fills the rest.
-        egui::Panel::right("inspector")
+        if self.missing_binary().is_some() {
+            egui::Panel::top("banner")
+                .show_separator_line(false)
+                .frame(gutter(g, g, g, 0))
+                .show(ui, |ui| self.missing_banner(ui));
+        }
+
+        let runbar_top = egui::Panel::bottom("runbar")
+            .show_separator_line(false)
+            .frame(gutter(g, 0, g, g))
+            .show(ui, |ui| runbar::show(ui, self))
+            .response
+            .rect
+            .top();
+
+        // One panel id per width mode: egui applies a panel's default size only
+        // once, so this is what lets a wide window snap to 440 while each mode
+        // still remembers a width the user dragged it to.
+        let inspector_id = if wide { "inspector_wide" } else { "inspector" };
+        let saved = quiet_resize_line(ui);
+        let inspector_rect = egui::Panel::right(inspector_id)
             .resizable(true)
             .show_separator_line(false) // keep the drag, drop the visible line
-            .default_size(320.0)
+            .default_size(if wide { 440.0 } else { 320.0 })
             .size_range(260.0..=460.0)
+            .frame(gutter(0, g, g, g))
             .show(ui, |ui| {
-                // With the cue panel docked below, the inspector scrolls within
-                // the top part and the cues take the rest; on its own it can use
-                // the full height. Either way it shrinks to its content.
+                ui.set_style(saved.clone()); // the contents keep the real style
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let height = ui.available_height();
+                // With the cue card open the column holds two cards; the
+                // inspector takes the top half and scrolls inside it.
                 let docked = cues::is_open(self);
-                let max = if docked { ui.available_height() * 0.6 } else { f32::INFINITY };
-                egui::ScrollArea::vertical()
-                    .id_salt("inspector_scroll")
-                    .max_height(max)
-                    .show(ui, |ui| {
-                        inspector::show(ui, self);
-                    });
+                let inspector_height = if docked { ((height - theme::GUTTER) / 2.0).floor() } else { height };
+                inspector::show(ui, self, inspector_height, wide);
                 if docked {
-                    ui.add_space(8.0);
-                    cues::panel(ui, self);
+                    ui.add_space(theme::GUTTER);
+                    let rest = ui.available_height();
+                    cues::panel(ui, self, rest);
                 }
-            });
+            })
+            .response
+            .rect;
+        ui.set_style(saved);
+        // The panel's edge is the inspector card's left side; the handle goes in
+        // the middle of the gutter, spanning the card.
+        let x = inspector_rect.left() - theme::GUTTER / 2.0;
+        let span = [
+            egui::pos2(x, inspector_rect.top() + theme::GUTTER),
+            egui::pos2(x, inspector_rect.bottom() - theme::GUTTER),
+        ];
+        let mut handles = vec![(inspector_id, span)];
 
-        // The command bar is a resizable bottom panel, like the inspector on the
-        // right. Added after the inspector so it spans only the central column's
-        // width; toggled by the ⌨ button in the sources bar.
-        if self.show_command {
-            egui::Panel::bottom("command")
-                .resizable(true)
-                .show_separator_line(false) // keep the drag, drop the visible line
-                .default_size(150.0)
-                .size_range(90.0..=420.0)
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        command::show_command(ui, self);
-                    });
-                });
+        egui::CentralPanel::default()
+            .frame(gutter(g, g, g, g))
+            .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
+                if self.show_command {
+                    let saved = quiet_resize_line(ui);
+                    let rect = egui::Panel::bottom("command")
+                        .resizable(true)
+                        .show_separator_line(false)
+                        .default_size(if wide { 220.0 } else { 180.0 })
+                        .size_range(90.0..=420.0)
+                        .frame(gutter(0, g, 0, 0))
+                        .show(ui, |ui| {
+                            ui.set_style(saved.clone());
+                            command::show_command(ui, self)
+                        })
+                        .response
+                        .rect;
+                    ui.set_style(saved);
+                    // This panel's edge is the top of the gutter above the card.
+                    let y = rect.top() + theme::GUTTER / 2.0;
+                    handles.push(("command", [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)]));
+                }
+                // The drop overlay covers this area: the main column above the
+                // command card, where the table (or the empty drop zone) lives.
+                self.drop_area = ui.available_rect_before_wrap();
+                self.error_line(ui);
+                table::show(ui, self, wide);
+            });
+        // Drawn after every panel, or the central column's gutter fill would
+        // paint over them.
+        for (id, span) in handles {
+            resize_handle(ui, id, span);
         }
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            sources::show(ui, self);
-            ui.add_space(8.0);
-
-            let red = egui::Color32::from_rgb(220, 80, 80);
-            if !self.binaries_ok() {
-                ui.colored_label(red, "⚠ ffmpeg/ffprobe not found — open ⚙ to set the path.");
-                ui.add_space(6.0);
-            }
-            if let Some(err) = &self.error {
-                ui.colored_label(red, format!("⚠ {err}"));
-                ui.add_space(6.0);
-            }
-
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if self.show_settings {
-                    settings_card(ui, self);
-                    ui.add_space(8.0);
-                }
-                table::show(ui, self);
-                ui.add_space(8.0);
-                command::show_issues(ui, self);
-            });
-        });
 
         self.overwrite_modal(ui.ctx());
-        self.drop_overlay(ui.ctx());
+        self.settings_window(ui.ctx());
+        runbar::log_window(ui.ctx(), self);
+        self.replace_modal(ui.ctx());
+        undo::shortcut(ui.ctx(), self);
+        undo::toast(ui.ctx(), self, runbar_top);
+        drop::overlay(ui.ctx(), self);
     }
 
-    /// While files are dragged over the window, dim it and say what a drop will
-    /// do — otherwise there's no cue that the window accepts drops at all.
-    fn drop_overlay(&self, ctx: &egui::Context) {
-        if ctx.input(|i| i.raw.hovered_files.is_empty()) {
-            return;
-        }
-        let text = if self.project.is_some() {
-            "drop to open file or add track"
-        } else {
-            "drop to open"
-        };
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("drop_overlay"),
-        ));
-        let screen = ctx.content_rect();
-        painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(180));
-        painter.text(
-            screen.center(),
-            egui::Align2::CENTER_CENTER,
-            text,
-            egui::FontId::proportional(22.0),
-            egui::Color32::WHITE,
+    /// The missing-ffmpeg banner card: what was tried, why it failed, and a
+    /// shortcut to Settings. Run stays disabled while it shows.
+    fn missing_banner(&mut self, ui: &mut egui::Ui) {
+        let Some((name, tried, err)) = self.missing_binary() else { return };
+        let text = format!(
+            "{name} not found — Tried {tried} — {err}. Set the path in Settings, or install ffmpeg and add it to PATH."
         );
+        let mut open = false;
+        Frame::NONE
+            .fill(theme::REMOVED)
+            .stroke(egui::Stroke::new(1.0, theme::ERROR_STROKE))
+            .corner_radius(8)
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        open = ui
+                            .add(widgets::button(widgets::with_icon(icon::GEAR_SIX, "Open settings")))
+                            .clicked();
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            widgets::wrapped_with_icon(ui, icon::X_CIRCLE, theme::ERROR, &text, theme::ERROR_TEXT, 13.0, 2);
+                        });
+                    });
+                });
+            });
+        if open {
+            self.show_settings = true;
+        }
     }
 
+    /// The last load/drop error, if any, as a dismissable line above the table.
+    fn error_line(&mut self, ui: &mut egui::Ui) {
+        let Some(err) = &self.error else { return };
+        let mut dismiss = false;
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                dismiss = widgets::close_x(ui, 18.0, "Dismiss");
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                    widgets::wrapped_with_icon(ui, icon::X_CIRCLE, theme::ERROR, err, theme::ERROR, 12.5, 4);
+                });
+            });
+        });
+        ui.add_space(2.0);
+        if dismiss {
+            self.error = None;
+        }
+    }
+
+    /// The overwrite confirmation for a run whose output already exists.
     fn overwrite_modal(&mut self, ctx: &egui::Context) {
         let Some(project) = &self.pending_run else { return };
         let path = project.output.display().to_string();
 
         let (mut start, mut cancel) = (false, false);
-        egui::Window::new("⚠ output file exists")
+        egui::Window::new(RichText::new(widgets::with_icon(icon::WARNING, "Output file exists")).font(theme::medium_font(14.0)))
             .collapsible(false)
             .resizable(false)
+            .default_width(420.0)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.label(format!("{path}\n\noverwrite it?"));
-                });
+                ui.add(egui::Label::new(RichText::new(&path).color(theme::WEAK)).wrap());
+                ui.add_space(4.0);
+                ui.label("Overwrite it?");
                 ui.add_space(8.0);
-                // `vertical_centered` won't center a nested horizontal (it fills
-                // the width), so pad the button row by half its slack ourselves.
                 ui.horizontal(|ui| {
-                    let font = egui::TextStyle::Button.resolve(ui.style());
-                    let pad = ui.spacing().button_padding.x * 2.0;
-                    let gap = ui.spacing().item_spacing.x;
-                    let width = |ui: &egui::Ui, s: &str| {
-                        ui.painter()
-                            .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
-                            .rect
-                            .width()
-                            + pad
-                    };
-                    let total = width(ui, "overwrite") + width(ui, "cancel") + gap;
-                    ui.add_space(((ui.available_width() - total) * 0.5).max(0.0));
-                    if ui.button("overwrite").clicked() {
-                        start = true;
-                    }
-                    if ui.button("cancel").clicked() {
-                        cancel = true;
-                    }
+                    start = ui.add(widgets::accent_button("Overwrite")).clicked();
+                    cancel = ui.add(widgets::button("Cancel")).clicked();
                 });
             });
 
@@ -586,6 +775,53 @@ impl InterlaceApp {
         } else if cancel {
             self.pending_run = None;
         }
+    }
+
+    /// The settings window: editable ffmpeg/ffprobe paths, their detected
+    /// version (or error), and a button to re-probe after editing.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let mut open = true;
+        let mut recheck = false;
+        egui::Window::new(RichText::new("Settings").font(theme::medium_font(14.0)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .anchor(egui::Align2::RIGHT_TOP, [-16.0, 64.0])
+            .show(ctx, |ui| {
+                widgets::section_label(ui, "BINARIES");
+                widgets::helper(ui, "A bare name resolves via PATH; enter a full path to override.");
+                ui.add_space(4.0);
+                egui::Grid::new("binaries_grid")
+                    .num_columns(2)
+                    .spacing([10.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("ffmpeg");
+                        ui.add(egui::TextEdit::singleline(&mut self.ffmpeg).desired_width(300.0));
+                        ui.end_row();
+                        ui.label("");
+                        binary_status(ui, &self.ffmpeg_status);
+                        ui.end_row();
+
+                        ui.label("ffprobe");
+                        ui.add(egui::TextEdit::singleline(&mut self.ffprobe).desired_width(300.0));
+                        ui.end_row();
+                        ui.label("");
+                        binary_status(ui, &self.ffprobe_status);
+                        ui.end_row();
+                    });
+                ui.add_space(6.0);
+                recheck = ui
+                    .add(widgets::button(widgets::with_icon(icon::ARROW_CLOCKWISE, "Re-check")))
+                    .clicked();
+            });
+        if recheck {
+            self.recheck_binaries();
+        }
+        self.show_settings = open;
     }
 }
 
@@ -601,8 +837,60 @@ impl Drop for InterlaceApp {
 }
 
 impl eframe::App for InterlaceApp {
+    /// @see more info in eframe's `App::ui`.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.render(ui);
+    }
+}
+
+/// Make egui's own panel resize line invisible for the next panel shown into
+/// `ui`, returning the style to restore (inside the panel, and after it).
+///
+/// egui paints that line in the hovered/active widget foreground color (white)
+/// right on the panel's edge, which here is a card's side rather than the
+/// middle of the gutter. It reads the parent `ui`'s style when painting, so
+/// blanking those two strokes there hides it; `resize_handle` draws ours.
+fn quiet_resize_line(ui: &mut egui::Ui) -> std::sync::Arc<egui::Style> {
+    let saved = ui.style().clone();
+    let widgets = &mut ui.style_mut().visuals.widgets;
+    widgets.hovered.fg_stroke = egui::Stroke::NONE;
+    widgets.active.fg_stroke = egui::Stroke::NONE;
+    saved
+}
+
+/// The resize affordance for panel `panel_id`: a 2 px rounded line along
+/// `span` (centered in the gutter), shown while the edge is hovered and in the
+/// accent while it's dragged. egui's grab zone straddles the panel edge, so
+/// it covers the gutter this is drawn in.
+fn resize_handle(ui: &egui::Ui, panel_id: &str, span: [egui::Pos2; 2]) {
+    let Some(resp) = ui.ctx().read_response(egui::Id::new(panel_id).with("__resize")) else { return };
+    let color = if resp.dragged() {
+        theme::ACCENT
+    } else if resp.hovered() {
+        theme::DIM
+    } else {
+        return;
+    };
+    let rect = egui::Rect::from_two_pos(span[0], span[1]).expand(1.0);
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(1), color);
+}
+
+/// How `job` ended, given ffmpeg's verdict. A successful preview is opened in
+/// the default player here, so a failure to launch it is reported like any
+/// other failure.
+fn finish(job: &Job, result: Result<(), run::RunFailure>) -> Outcome {
+    let secs = job.started.elapsed().as_secs_f64();
+    match (result, &job.kind) {
+        (Err(_), _) if job.cancelled => Outcome::Cancelled,
+        (Err(f), _) => Outcome::Failed { message: failure_line(&f), log: f.stderr_tail },
+        (Ok(()), JobKind::Preview { clip, .. }) => match run::open_in_default_app(clip) {
+            Ok(()) => Outcome::PreviewOpened,
+            Err(e) => Outcome::Failed { message: e.clone(), log: e },
+        },
+        (Ok(()), JobKind::Run { output }) => Outcome::Wrote {
+            bytes: output.as_deref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len()),
+            secs,
+        },
     }
 }
 
@@ -622,85 +910,47 @@ fn command_args(command: &str) -> Vec<String> {
 }
 
 /// Turn a spawn result into the initial `RunState`: a live `Running` on success,
-/// or a `Done` carrying the launch error. Shared by the model-driven and
-/// escape-hatch run paths so their starting state can't drift apart.
-/// `open_on_success` is the preview clip to open when the run finishes.
-fn run_state_from(result: Result<Receiver<RunUpdate>, String>, open_on_success: Option<PathBuf>) -> RunState {
+/// or a `Done` carrying the launch error. Shared by every job path so their
+/// starting state can't drift apart.
+fn run_state_from(result: Result<RunHandle, String>, job: Job) -> RunState {
     match result {
-        Ok(rx) => RunState::Running {
-            rx,
-            fraction: 0.0,
-            line: "starting…".into(),
-            open_on_success,
+        Ok(handle) => RunState::Running { handle, job, fraction: 0.0, speed: None },
+        Err(e) => RunState::Done {
+            job,
+            outcome: Outcome::Failed { message: e.clone(), log: e },
         },
-        Err(e) => RunState::Done { ok: false, line: e },
     }
 }
 
-fn progress_line(p: &run::Progress) -> String {
-    p.fraction
-        .map(|f| format!("{:.0}%", f * 100.0))
-        .unwrap_or_else(|| "—".into())
-}
-
+/// The run card's one-line failure: exit code plus ffmpeg's last stderr line,
+/// which is almost always the actual error.
 fn failure_line(f: &run::RunFailure) -> String {
-    // The last stderr line is almost always the actual error.
     let last = f.stderr_tail.lines().last().unwrap_or("ffmpeg failed");
-    let code = f.code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
-    format!("failed (exit {code}): {last}")
+    match f.code {
+        Some(code) => format!("ffmpeg exited with code {code}: {last}"),
+        None => last.to_string(),
+    }
 }
 
-/// The collapsible binaries panel: editable ffmpeg/ffprobe paths, their detected
-/// version (or error), and a button to re-probe after editing.
-fn settings_card(ui: &mut egui::Ui, app: &mut InterlaceApp) {
-    card(ui, |ui| {
-        section_label(ui, "BINARIES");
-        ui.add_space(4.0);
-        ui.weak("A bare name resolves via PATH; enter a full path to override.");
-        ui.add_space(6.0);
-
-        egui::Grid::new("binaries_grid")
-            .num_columns(2)
-            .spacing([10.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("ffmpeg");
-                ui.text_edit_singleline(&mut app.ffmpeg);
-                ui.end_row();
-                ui.label("");
-                status_line(ui, &app.ffmpeg_status);
-                ui.end_row();
-
-                ui.label("ffprobe");
-                ui.text_edit_singleline(&mut app.ffprobe);
-                ui.end_row();
-                ui.label("");
-                status_line(ui, &app.ffprobe_status);
-                ui.end_row();
-            });
-
-        ui.add_space(6.0);
-        if ui.button("re-check").clicked() {
-            app.recheck_binaries();
+/// A binary's last probe result in Settings: version, error, or "not checked".
+fn binary_status(ui: &mut egui::Ui, status: &Result<String, String>) {
+    ui.horizontal(|ui| {
+        ui.set_max_width(300.0);
+        match status {
+            Ok(v) if v.is_empty() => {
+                widgets::line(ui, RichText::new("not checked").color(theme::WEAK));
+            }
+            Ok(v) => {
+                widgets::status_line(ui, icon::CHECK_CIRCLE, v, theme::SUCCESS);
+            }
+            Err(e) => {
+                widgets::status_line(ui, icon::X_CIRCLE, e, theme::ERROR);
+            }
         }
     });
 }
 
-/// Render a binary's last probe result: green version, red error, or "not checked".
-fn status_line(ui: &mut egui::Ui, status: &Result<String, String>) {
-    match status {
-        Ok(v) if v.is_empty() => {
-            ui.weak("not checked");
-        }
-        Ok(v) => {
-            ui.colored_label(egui::Color32::from_rgb(80, 200, 120), format!("✓ {v}"));
-        }
-        Err(e) => {
-            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), format!("✗ {e}"));
-        }
-    }
-}
-
-// --- shared drawing helpers (used by the submodules) -------------------------
+// --- shared helpers (used by the submodules) ---------------------------------
 
 /// A path's final component as an owned, lossy `String`, or `None` when the path
 /// has no file name (ends in `..`, or is empty). Callers supply their own fallback
@@ -709,81 +959,37 @@ pub(super) fn file_name_lossy(path: &Path) -> Option<String> {
     path.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
-/// A rounded "card" panel wrapping a section, matching the mockup's grouping.
-pub(super) fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::same(10))
-        .corner_radius(egui::CornerRadius::same(8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add(ui);
-        });
+/// The short id of `streams[idx]`: its kind letter plus its index among the
+/// streams of that kind in output order (`A2` = the third audio row). Removed
+/// rows count, so ids don't jump while a removal is only pending.
+pub(super) fn stream_id(project: &Project, idx: usize) -> String {
+    let kind = project.streams[idx].source.kind;
+    let n = project.streams[..idx].iter().filter(|s| s.source.kind == kind).count();
+    format!("{}{n}", kind.spec().to_ascii_uppercase())
 }
-/// A fixed 22×22 close button whose `×` is painted at the exact rect center
-/// (egui's `Button` can't perfectly center a lone glyph). The fixed footprint
-/// also stops hover expansion from reflowing the header. Shared by the
-/// inspector and the cue panel headers. Returns `true` on click.
-pub(super) fn close_button(ui: &mut egui::Ui, hover: &str) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-    let resp = resp.on_hover_text(hover);
-    if ui.is_rect_visible(rect) {
-        let v = ui.style().interact(&resp);
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(4), v.weak_bg_fill);
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "×",
-            egui::FontId::proportional(16.0),
-            v.fg_stroke.color,
-        );
+
+/// `streams[idx]` named for one line: `id · lang · title`, falling back to the
+/// source file name and then the codec when there's no title (`S9 · Night
+/// Train.pt-BR.srt`, `A1 · jpn · Japanese Stereo`).
+pub(super) fn short_name(project: &Project, idx: usize) -> String {
+    let s = &project.streams[idx];
+    let mut parts = vec![stream_id(project, idx)];
+    if let Some(lang) = &s.meta.language {
+        parts.push(lang.clone());
     }
-    resp.clicked()
+    let name = s.meta.title.clone().or_else(|| {
+        (s.source.input != 0)
+            .then(|| file_name_lossy(&project.inputs[s.source.input].path))
+            .flatten()
+    });
+    parts.push(name.unwrap_or_else(|| s.source.codec.clone()));
+    parts.join(" · ")
 }
 
-/// A small uppercase section heading like "SOURCES" / "INSPECTOR".
-pub(super) fn section_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(
-        egui::RichText::new(text)
-            .small()
-            .strong()
-            .color(egui::Color32::from_gray(150)),
-    );
-}
-
-/// A filled, rounded type badge (video/audio/subtitle color-coded).
-pub(super) fn badge(ui: &mut egui::Ui, kind: Kind) {
-    egui::Frame::NONE
-        .fill(kind_color(kind))
-        .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(kind_text(kind))
-                    .small()
-                    .strong()
-                    .color(egui::Color32::WHITE),
-            );
-        });
-}
-
-pub(super) fn kind_color(kind: Kind) -> egui::Color32 {
-    match kind {
-        Kind::Video => egui::Color32::from_rgb(37, 99, 235),    // blue
-        Kind::Audio => egui::Color32::from_rgb(124, 58, 237),   // purple
-        Kind::Subtitle => egui::Color32::from_rgb(217, 119, 6), // amber
-        Kind::Attachment | Kind::Data => egui::Color32::from_gray(90),
-    }
-}
-
-pub(super) fn kind_text(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Video => "video",
-        Kind::Audio => "audio",
-        Kind::Subtitle => "subtitle",
-        Kind::Attachment => "attach",
-        Kind::Data => "data",
-    }
+/// A signed offset for display, with a real minus sign: `+0.150 s`, `−0.500 s`.
+pub(super) fn format_offset(secs: f64) -> String {
+    let sign = if secs < 0.0 { '−' } else { '+' };
+    format!("{sign}{:.3} s", secs.abs())
 }
 
 /// Open a native file picker for media files. Returns the chosen path, if any.
@@ -791,55 +997,50 @@ pub(super) fn pick_media_file() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .add_filter(
             "Media",
-            &["mkv", "mp4", "m4v", "mov", "webm", "flac", "aac", "ac3", "srt", "ass", "sup"],
+            &["mkv", "mp4", "m4v", "mov", "webm", "avi", "ts", "m2ts", "flac", "aac", "ac3", "srt", "ass", "sup"],
         )
         .pick_file()
 }
 
-/// Extensions treated as a single external track rather than a container. Shared
-/// by the "add track" picker filter and drag-and-drop routing, so what the picker
-/// offers and what a drop embeds can't drift apart.
-const TRACK_EXTENSIONS: &[&str] = &[
-    "srt", "ass", "ssa", "vtt", "sup", "sub", // subtitles
-    "flac", "aac", "ac3", "eac3", "dts", "mp3", "opus", "ogg", "wav", "m4a", "thd",
-    "mka", // audio
-];
-
-/// Whether `path` looks like an embeddable track (by extension, case-insensitive).
-/// Anything else — including a file with no extension — is treated as a container.
-fn is_track_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| TRACK_EXTENSIONS.iter().any(|t| t.eq_ignore_ascii_case(e)))
-}
-
-/// Order a multi-file drop for processing: the first container (if any) first, so
-/// the tracks have a project to embed into, then every track in drop order.
-/// Further containers come back as `skipped` — only one file can be the project,
-/// and loading a second would silently replace the first.
-fn order_drops(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let (tracks, mut containers): (Vec<PathBuf>, Vec<PathBuf>) =
-        paths.into_iter().partition(|p| is_track_file(p));
-    let mut ordered = Vec::with_capacity(tracks.len() + 1);
-    if !containers.is_empty() {
-        ordered.push(containers.remove(0));
-    }
-    ordered.extend(tracks);
-    (ordered, containers)
-}
-
-/// Open a native file picker for an embeddable track. Filtered to audio and
-/// subtitle files only — you embed one external track, not another container.
-pub(super) fn pick_track_file() -> Option<PathBuf> {
+/// Open a native file picker for an audio track to insert (`+ Audio`).
+pub(super) fn pick_audio_file() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .add_filter("Audio or subtitle", TRACK_EXTENSIONS)
+        .add_filter("Audio", drop::AUDIO_EXTENSIONS)
         .pick_file()
 }
+
+/// Open a native file picker for a subtitle track to insert (`+ Subtitle`).
+pub(super) fn pick_subtitle_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("Subtitles", drop::SUBTITLE_EXTENSIONS)
+        .pick_file()
+}
+
+/// Ask where to write the output, starting from the current path.
+pub(super) fn pick_output_file(current: &Path) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().add_filter("Media", &["mkv", "mp4", "mov", "webm", "mka", "mks"]);
+    if let Some(dir) = current.parent().filter(|d| d.is_dir()) {
+        dialog = dialog.set_directory(dir);
+    }
+    if let Some(name) = file_name_lossy(current) {
+        dialog = dialog.set_file_name(name);
+    }
+    dialog.save_file()
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Input, Meta, Source};
+    use crate::model::{Input, Kind, Meta, Source};
+
+    /// A context with the app's theme and fonts, as `new` installs them (minus
+    /// the system fallbacks, so tests don't depend on the machine's fonts).
+    fn test_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        theme::install(&ctx, false);
+        ctx
+    }
 
     fn demo_project() -> Project {
         let mk = |input, index, kind, codec: &str, meta| {
@@ -880,7 +1081,7 @@ mod tests {
     #[test]
     fn renders_without_panicking() {
         let mut app = app_with_demo();
-        let ctx = egui::Context::default();
+        let ctx = test_ctx();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
 
@@ -888,7 +1089,7 @@ mod tests {
     fn renders_empty_state() {
         let mut app = InterlaceApp::empty();
         app.error = Some("something went wrong".into());
-        let ctx = egui::Context::default();
+        let ctx = test_ctx();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
 
@@ -965,7 +1166,7 @@ mod tests {
             p.streams.push(embedded);
         }
         app.selection.set_single(app.project.as_ref().unwrap().streams.len() - 1);
-        let ctx = egui::Context::default();
+        let ctx = test_ctx();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
 
@@ -1000,7 +1201,7 @@ mod tests {
             streams[1].removed = true; // pending removal → red badge, struck row
             streams[2].meta.title = Some("Forced".into()); // retag vs orig_meta
         }
-        let ctx = egui::Context::default();
+        let ctx = test_ctx();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
 
@@ -1010,8 +1211,8 @@ mod tests {
         app.show_settings = true;
         app.ffmpeg_status = Err("not found (`ffmpeg`)".into());
         app.ffprobe_status = Ok("ffprobe version 8.1".into());
-        assert!(!app.binaries_ok());
-        let ctx = egui::Context::default();
+        assert!(app.missing_binary().is_some());
+        let ctx = test_ctx();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
 
@@ -1046,7 +1247,7 @@ mod tests {
     fn renders_edited_command_bar_without_panicking() {
         let mut app = app_with_demo();
         app.command_edit = Some("ffmpeg -i in.mkv -c copy out.mkv".into());
-        let ctx = egui::Context::default();
+        let ctx = test_ctx();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
 
@@ -1055,9 +1256,133 @@ mod tests {
     /// (a discard) exactly like changing central content does.
     #[test]
     fn toggling_command_panel_discards_the_unsettled_frame() {
-        let mut app = app_with_demo();
-        let ctx = egui::Context::default();
-        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(780.0, 720.0));
+        for (w, h) in [(1000.0, 650.0), (1600.0, 900.0)] {
+            for loaded in [false, true] {
+                let mut app = if loaded { app_with_demo() } else { InterlaceApp::empty() };
+                let reds = toggle_reds(&mut app, w, h);
+                assert_eq!(reds, [0; 9], "{w}x{h}, loaded={loaded}: red outlines per frame");
+            }
+        }
+    }
+
+    /// Clicking the terminal button flips the card mid-frame (the sources card
+    /// is drawn before the table), which must not flash outlines either.
+    #[test]
+    fn clicking_the_command_toggle_does_not_flash() {
+        for loaded in [false, true] {
+            let mut app = if loaded { app_with_demo() } else { InterlaceApp::empty() };
+            let ctx = test_ctx();
+            let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 650.0));
+            // The terminal toggle sits second from the right in the sources card.
+            let at = egui::pos2(921.0, 31.0);
+            let frame = |events: Vec<egui::Event>| egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let press = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let mut reds = Vec::new();
+            for events in [
+                vec![egui::Event::PointerMoved(at)],
+                vec![press(true)],
+                vec![press(false)],
+                vec![],
+                vec![],
+            ] {
+                let out = ctx.run_ui(frame(events), |ui| app.render(ui));
+                reds.push(out.shapes.iter().map(|s| count_red(&s.shape)).sum::<usize>());
+            }
+            assert!(app.show_command, "the click toggled the card");
+            assert_eq!(reds, [0; 5], "loaded={loaded}: red outlines per frame");
+        }
+    }
+
+    /// Clicking from one stream to another swaps the inspector's sections (a
+    /// video has no language row, audio has conversion…), which must not flash
+    /// id-clash outlines on any frame.
+    #[test]
+    fn switching_streams_does_not_flash() {
+        for (w, h) in [(1000.0, 650.0), (1600.0, 900.0)] {
+            let mut app = app_with_demo();
+            push_embedded_sub(&mut app);
+            app.selection.clear();
+            let ctx = test_ctx();
+            let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
+            let frame = |events: Vec<egui::Event>| egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let mut reds = Vec::new();
+            // Rows sit 34 px apart below the header; click each, then back to the first.
+            for row in [0, 1, 2, 3, 0, 2] {
+                let at = egui::pos2(200.0, 140.0 + 34.0 * row as f32);
+                let press = |pressed| egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                for events in [vec![egui::Event::PointerMoved(at)], vec![press(true)], vec![press(false)], vec![], vec![]] {
+                    let out = ctx.run_ui(frame(events), |ui| app.render(ui));
+                    reds.push(out.shapes.iter().map(|s| count_red(&s.shape)).sum::<usize>());
+                }
+                assert_eq!(app.selection.single(), Some(row), "{w}x{h}: row {row} got selected");
+            }
+            assert!(reds.iter().all(|&r| r == 0), "{w}x{h}: red outlines per frame {reds:?}");
+        }
+    }
+
+    /// Other state changes that reshape the right column or the table don't
+    /// flash outlines either: the cue card opening, a multi-selection, a
+    /// removal, and a converted copy being added.
+    #[test]
+    fn reshaping_changes_do_not_flash() {
+        let changes: Vec<Box<dyn Fn(&mut InterlaceApp)>> = vec![
+            Box::new(|app| {
+                app.selection.set_single(3);
+                open_ready_cues(app);
+            }),
+            Box::new(|app| app.selection.set_many([1, 2, 3])),
+            Box::new(|app| {
+                app.selection.set_single(1);
+                app.remove_selected();
+            }),
+            Box::new(|app| app.add_converted_streams(&[1])),
+        ];
+        for (i, change) in changes.iter().enumerate() {
+            let mut app = app_with_demo();
+            push_embedded_sub(&mut app);
+            let ctx = test_ctx();
+            let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 650.0));
+            let input = || egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut reds = Vec::new();
+            for f in 0..6 {
+                if f == 2 {
+                    change(&mut app);
+                }
+                let out = ctx.run_ui(input(), |ui| app.render(ui));
+                reds.push(out.shapes.iter().map(|s| count_red(&s.shape)).sum::<usize>());
+            }
+            assert_eq!(reds, [0; 6], "change {i}: red outlines per frame");
+        }
+    }
+
+    /// Shapes drawn in egui's pure-red error color: the id-clash outlines.
+    fn count_red(shape: &egui::epaint::Shape) -> usize {
+        use egui::epaint::Shape;
+        let red = egui::Color32::from_rgb(255, 0, 0);
+        match shape {
+            Shape::Rect(r) if r.stroke.color == red || r.fill == red => 1,
+            Shape::LineSegment { stroke, .. } if stroke.color == red => 1,
+            Shape::Circle(c) if c.stroke.color == red || c.fill == red => 1,
+            Shape::Vec(v) => v.iter().map(count_red).sum(),
+            _ => 0,
+        }
+    }
+
+    /// Red id-clash shapes per frame while toggling the command card: three
+    /// steady frames, three after showing it, three after hiding it.
+    fn toggle_reds(app: &mut InterlaceApp, w: f32, h: f32) -> Vec<usize> {
+        let ctx = test_ctx();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
         let input = || egui::RawInput {
             screen_rect: Some(screen),
             ..Default::default()
@@ -1079,11 +1404,14 @@ mod tests {
             out.shapes.iter().map(|s| count_red(&s.shape, red)).sum::<usize>()
         };
 
-        assert_eq!(reds(&mut app), 0); // steady state is clean
-        app.show_command = false;
-        assert_eq!(reds(&mut app), 0, "hiding the panel must not flash id-clash outlines");
-        app.show_command = true;
-        assert_eq!(reds(&mut app), 0, "showing the panel must not flash id-clash outlines");
+        let mut out = Vec::new();
+        for show in [false, true, false] {
+            app.show_command = show;
+            for _ in 0..3 {
+                out.push(reds(app));
+            }
+        }
+        out
     }
 
     /// A very long source-file name must not widen the top row past the window:
@@ -1095,7 +1423,7 @@ mod tests {
         let mut app = app_with_demo();
         app.project.as_mut().unwrap().inputs[0].path =
             PathBuf::from("2013.Scary.Movie.5.1920x1080.BDRip.x264.DTS-HD.MA.mkv");
-        let ctx = egui::Context::default();
+        let ctx = test_ctx();
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(790.0, 720.0));
         let input = egui::RawInput {
             screen_rect: Some(screen),
@@ -1104,13 +1432,120 @@ mod tests {
         let _ = ctx.run_ui(input, |ui| app.render(ui));
     }
 
+    /// Render one frame of `app` in a `w`×`h` window.
+    fn render_at(app: &mut InterlaceApp, w: f32, h: f32) {
+        let ctx = test_ctx();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h))),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| app.render(ui));
+    }
+
+    /// The wide layout (split columns, stream details) renders with a stream
+    /// that has an offset, so every inspector section is drawn.
+    #[test]
+    fn renders_wide_layout() {
+        let mut app = app_with_demo();
+        app.project.as_mut().unwrap().streams[1].offset_secs = -0.5;
+        app.show_command = true;
+        render_at(&mut app, 1600.0, 900.0);
+    }
+
+    /// Each run-card state renders: running (inspector locked), done, failed
+    /// (with the log window open), cancelled, and a running preview.
+    #[test]
+    fn renders_every_run_state() {
+        let run = || Job::new(JobKind::Run { output: Some(PathBuf::from("movie.remux.mkv")) });
+        let states: Vec<Box<dyn Fn() -> RunState>> = vec![
+            Box::new(|| run_state_from(Ok(RunHandle::detached(std::sync::mpsc::channel().1)), run())),
+            Box::new(|| RunState::Done { job: run(), outcome: Outcome::Wrote { bytes: Some(1_410_000_000), secs: 38.0 } }),
+            Box::new(|| RunState::Done {
+                job: run(),
+                outcome: Outcome::Failed { message: "ffmpeg exited with code 1: boom".into(), log: "a\nb\nboom".into() },
+            }),
+            Box::new(|| RunState::Done { job: run(), outcome: Outcome::Cancelled }),
+            Box::new(|| {
+                let job = Job::new(JobKind::Preview { clip: PathBuf::from("clip.mkv"), start: 93.6, len: 30.0 });
+                run_state_from(Ok(RunHandle::detached(std::sync::mpsc::channel().1)), job)
+            }),
+        ];
+        for state in states {
+            let mut app = app_with_demo();
+            app.run_state = state();
+            app.show_log = true;
+            render_at(&mut app, 1000.0, 650.0);
+        }
+    }
+
+    /// A real run locks the inspector and blocks a second job; a preview
+    /// doesn't lock the inspector but still holds the ffmpeg slot.
+    #[test]
+    fn running_job_kinds_gate_run_and_inspector() {
+        let mut app = app_with_demo();
+        let job = Job::new(JobKind::Run { output: None });
+        app.run_state = run_state_from(Ok(RunHandle::detached(std::sync::mpsc::channel().1)), job);
+        assert!(app.run_state.is_main_running());
+        assert!(app.run_blocker().is_some());
+
+        let job = Job::new(JobKind::Preview { clip: PathBuf::from("c.mkv"), start: 0.0, len: 10.0 });
+        app.run_state = run_state_from(Ok(RunHandle::detached(std::sync::mpsc::channel().1)), job);
+        assert!(!app.run_state.is_main_running());
+        assert!(app.run_blocker().is_some());
+    }
+
+    /// A finished job settles into the matching outcome; a cancelled one isn't
+    /// reported as a failure.
+    #[test]
+    fn finish_maps_results_to_outcomes() {
+        let fail = || Err(run::RunFailure { code: Some(1), stderr_tail: "x\nNo such file".into() });
+        let job = Job::new(JobKind::Run { output: None });
+        assert!(matches!(finish(&job, Ok(())), Outcome::Wrote { bytes: None, .. }));
+        match finish(&job, fail()) {
+            Outcome::Failed { message, .. } => assert_eq!(message, "ffmpeg exited with code 1: No such file"),
+            _ => panic!("expected a failure"),
+        }
+        let mut cancelled = Job::new(JobKind::Run { output: None });
+        cancelled.cancelled = true;
+        assert!(matches!(finish(&cancelled, fail()), Outcome::Cancelled));
+    }
+
+    /// Stream ids count per kind in output order, and short names fall back
+    /// from title to file name to codec.
+    #[test]
+    fn stream_ids_and_short_names() {
+        let mut app = app_with_demo();
+        let row = push_embedded_sub(&mut app);
+        let p = app.project.as_ref().unwrap();
+        assert_eq!(stream_id(p, 0), "V0");
+        assert_eq!(stream_id(p, 1), "A0");
+        assert_eq!(stream_id(p, row), "S1");
+        assert_eq!(short_name(p, 1), "A0 · jpn · Japanese");
+        assert_eq!(short_name(p, 2), "S0 · eng · subrip");
+        assert_eq!(short_name(p, row), "S1 · subs.srt");
+        assert_eq!(format_offset(-0.5), "−0.500 s");
+    }
+
+    /// A chip's × on a track file drops its streams and input; on the main
+    /// file it closes the project.
+    #[test]
+    fn remove_input_drops_its_streams_or_closes() {
+        let mut app = app_with_demo();
+        push_embedded_sub(&mut app);
+        app.remove_input(1);
+        let p = app.project.as_ref().unwrap();
+        assert_eq!((p.inputs.len(), p.streams.len()), (1, 3));
+        app.remove_input(0);
+        assert!(app.project.is_none());
+    }
+
     #[test]
     fn renders_with_command_panel_hidden() {
         // Toggling the command panel off drops the bottom panel entirely; the
         // rest of the layout must still render (and compatibility findings stay).
         let mut app = app_with_demo();
         app.show_command = false;
-        let ctx = egui::Context::default();
+        let ctx = test_ctx();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
 
@@ -1147,7 +1582,7 @@ mod tests {
         app.project.as_mut().unwrap().streams[row].offset_secs = 1.5;
         app.selection.set_single(row);
         open_ready_cues(&mut app);
-        let ctx = egui::Context::default();
+        let ctx = test_ctx();
         for _ in 0..2 {
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
         }
@@ -1172,8 +1607,59 @@ mod tests {
         app.command_edit = None;
 
         let (_tx, rx) = std::sync::mpsc::channel();
-        app.run_state = run_state_from(Ok(rx), None);
+        app.run_state = run_state_from(Ok(RunHandle::detached(rx)), Job::new(JobKind::Run { output: None }));
         assert!(app.preview_blocker().is_some(), "a run in progress");
+    }
+
+    /// The cue card's loading, failed and no-match states render, at both widths.
+    #[test]
+    fn renders_cue_card_states() {
+        let views: Vec<Box<dyn Fn() -> cues::CueView>> = vec![
+            Box::new(|| cues::CueView::loading(PathBuf::from("subs.srt"), 0)),
+            Box::new(|| cues::CueView::failed(PathBuf::from("subs.srt"), 0, "Invalid data found when processing input")),
+            Box::new(|| {
+                let mut v = cues::CueView::ready(
+                    PathBuf::from("subs.srt"),
+                    0,
+                    vec![crate::subs::Cue { start_secs: 1.0, end_secs: 2.0, text: "Olá".into() }],
+                );
+                v.set_filter("xícara");
+                v
+            }),
+        ];
+        for view in views {
+            for (w, h) in [(1000.0, 650.0), (1600.0, 900.0)] {
+                let mut app = app_with_demo();
+                push_embedded_sub(&mut app);
+                app.cues = Some(view());
+                render_at(&mut app, w, h);
+                assert!(app.cues.is_some(), "the card stays while its stream exists");
+            }
+        }
+    }
+
+    /// Preview tests the selected track, or else the cue card's track.
+    #[test]
+    fn preview_subject_prefers_selection_then_cue_card() {
+        let mut app = app_with_demo();
+        let row = push_embedded_sub(&mut app);
+        open_ready_cues(&mut app);
+        app.selection.set_single(0); // video: not testable
+        assert_eq!(app.preview_subject(), Some(row));
+        app.selection.set_single(1);
+        assert_eq!(app.preview_subject(), Some(1));
+    }
+
+    /// A stream whose cues were read this session reopens from the cache.
+    #[test]
+    fn open_cues_uses_the_session_cache() {
+        let mut app = app_with_demo();
+        let row = push_embedded_sub(&mut app);
+        let cue = crate::subs::Cue { start_secs: 1.0, end_secs: 2.0, text: "Hi".into() };
+        app.cue_cache.insert((PathBuf::from("subs.srt"), 0), std::sync::Arc::new(vec![cue]));
+        app.open_cues(row);
+        assert!(matches!(app.cues.as_ref().unwrap().load, cues::CueLoad::Ready(_)));
+        assert_eq!(app.cue_row(), Some(row));
     }
 
     /// Deleting the embedded track the viewer shows drops the viewer with it.
@@ -1184,7 +1670,7 @@ mod tests {
         open_ready_cues(&mut app);
         app.selection.set_single(row);
         app.remove_selected();
-        let ctx = egui::Context::default();
+        let ctx = test_ctx();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
         assert!(app.cues.is_none());
     }
@@ -1196,7 +1682,7 @@ mod tests {
         let mut app = app_with_demo();
         app.project.as_mut().unwrap().streams[2].source.codec = "hdmv_pgs_subtitle".into();
         app.selection.set_single(2);
-        let ctx = egui::Context::default();
+        let ctx = test_ctx();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
     }
 
@@ -1225,7 +1711,7 @@ mod tests {
     fn delete_key_removes_selection() {
         let mut app = app_with_demo();
         app.selection.set_many([0, 2]);
-        let ctx = egui::Context::default();
+        let ctx = test_ctx();
         let input = egui::RawInput {
             events: vec![egui::Event::Key {
                 key: egui::Key::Delete,
@@ -1257,30 +1743,6 @@ mod tests {
     }
 
     #[test]
-    fn is_track_file_matches_track_extensions_case_insensitively() {
-        assert!(is_track_file(Path::new("subs.SRT")));
-        assert!(is_track_file(Path::new(r"C:\media\commentary.flac")));
-        assert!(!is_track_file(Path::new("movie.mkv")));
-        assert!(!is_track_file(Path::new("clip.mp4")));
-        assert!(!is_track_file(Path::new("no_extension")));
-    }
-
-    /// The container goes first so the tracks have something to embed into;
-    /// extra containers are skipped rather than replacing the first.
-    #[test]
-    fn order_drops_puts_first_container_first_and_skips_the_rest() {
-        let paths = ["eng.srt", "movie.mkv", "other.mkv", "c.flac"].map(PathBuf::from).to_vec();
-        let (ordered, skipped) = order_drops(paths);
-        assert_eq!(ordered, ["movie.mkv", "eng.srt", "c.flac"].map(PathBuf::from));
-        assert_eq!(skipped, [PathBuf::from("other.mkv")]);
-
-        // Tracks only: drop order is kept, nothing skipped.
-        let (ordered, skipped) = order_drops(["b.ass", "a.aac"].map(PathBuf::from).to_vec());
-        assert_eq!(ordered, ["b.ass", "a.aac"].map(PathBuf::from));
-        assert!(skipped.is_empty());
-    }
-
-    #[test]
     fn open_dropped_empty_is_a_noop() {
         let mut app = app_with_demo();
         app.error = Some("earlier".into());
@@ -1299,9 +1761,90 @@ mod tests {
             }],
             ..Default::default()
         };
-        let ctx = egui::Context::default();
+        let ctx = test_ctx();
         let _ = ctx.run_ui(input(), |ui| app_with_demo().render(ui));
         let _ = ctx.run_ui(input(), |ui| InterlaceApp::empty().render(ui));
+    }
+
+    /// The overlay renders every kind of plan: replace with edits, insert one
+    /// and several, video plus tracks, skipped files, and a refusal.
+    #[test]
+    fn renders_drop_overlay_for_each_plan() {
+        let drops: [&[&str]; 5] = [
+            &["movie.mkv"],
+            &["subs.srt"],
+            &["a.srt", "b.ac3"],
+            &["other.mp4", "a.srt", "b.ac3", "notes.txt"],
+            &["notes.txt"],
+        ];
+        for files in drops {
+            let mut app = app_with_demo();
+            app.project.as_mut().unwrap().streams[1].removed = true; // an edit
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 650.0)));
+            input.hovered_files = files
+                .iter()
+                .map(|f| egui::HoveredFile { path: Some(PathBuf::from(f)), ..Default::default() })
+                .collect();
+            let ctx = test_ctx();
+            let _ = ctx.run_ui(input, |ui| app.render(ui));
+        }
+    }
+
+    /// Edits are counted per changed stream, plus a reorder; the (probed)
+    /// title isn't one.
+    #[test]
+    fn edit_count_tallies_changes() {
+        let mut app = app_with_demo();
+        assert_eq!(drop::edit_count(app.project.as_ref().unwrap()), 0);
+        {
+            let p = app.project.as_mut().unwrap();
+            p.streams[1].removed = true;
+            p.streams[2].offset_secs = 0.5;
+            p.title = Some("x".into());
+        }
+        app.reorder(2, 0);
+        assert_eq!(drop::edit_count(app.project.as_ref().unwrap()), 3);
+    }
+
+    /// Removing a track file is one undo step, announced by the toast; undo
+    /// brings the input, its stream and the selection back.
+    #[test]
+    fn remove_input_is_undoable() {
+        let mut app = app_with_demo();
+        let row = push_embedded_sub(&mut app);
+        app.selection.set_single(row);
+        app.remove_input(1);
+        assert_eq!(app.project.as_ref().unwrap().inputs.len(), 1);
+        assert!(app.toast.as_ref().is_some_and(|t| t.text.contains("subs.srt")));
+        render_at(&mut app, 1000.0, 650.0); // draws the toast
+
+        app.undo();
+        let p = app.project.as_ref().unwrap();
+        assert_eq!((p.inputs.len(), p.streams.len()), (2, 4));
+        assert_eq!(app.selection.single(), Some(row));
+        assert!(app.toast.is_none());
+
+        // Closing the main file comes back too.
+        app.remove_input(0);
+        assert!(app.project.is_none());
+        app.undo();
+        assert!(app.project.is_some());
+    }
+
+    /// A drop that would discard edits waits for confirmation; refusals and
+    /// empty drops do nothing.
+    #[test]
+    fn replacing_an_edited_file_asks_first() {
+        let mut app = app_with_demo();
+        app.project.as_mut().unwrap().streams[1].removed = true;
+        app.open_dropped(vec![PathBuf::from("other.mkv")]);
+        assert!(app.pending_drop.is_some());
+        render_at(&mut app, 1000.0, 650.0); // draws the confirm window
+
+        let mut app = InterlaceApp::empty();
+        app.open_dropped(vec![PathBuf::from("subs.srt")]); // no video open: refused
+        assert!(app.project.is_none() && app.pending_drop.is_none() && app.undo.is_empty());
     }
 
     #[test]
@@ -1318,7 +1861,7 @@ mod tests {
     fn renders_mixed_multi_selection() {
         let mut app = app_with_demo();
         app.selection.select_all(3);
-        let ctx = egui::Context::default();
+        let ctx = test_ctx();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
 
         // And an all-audio selection that is partly converting, which shows the

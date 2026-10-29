@@ -11,8 +11,9 @@
 
 use crate::model::Project;
 use std::io::{BufRead, BufReader, Read};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 /// A single progress sample, one per ffmpeg progress block.
@@ -43,6 +44,33 @@ pub enum RunUpdate {
     Finished { result: Result<(), RunFailure> },
 }
 
+/// A launched ffmpeg job: its update channel, plus a way to stop it early.
+pub struct RunHandle {
+    /// Progress samples, then exactly one `Finished`.
+    pub rx: Receiver<RunUpdate>,
+    /// The child process, shared with the thread that waits on it. `None` only
+    /// for the test-built handles that have no process behind them.
+    child: Option<Arc<Mutex<Child>>>,
+}
+
+impl RunHandle {
+    /// Kill the ffmpeg process. The run thread still reports `Finished` (as a
+    /// failure), so callers keep draining `rx` as usual.
+    pub fn cancel(&self) {
+        if let Some(child) = &self.child
+            && let Ok(mut child) = child.lock()
+        {
+            let _ = child.kill();
+        }
+    }
+
+    /// A handle with no process behind it, fed by the caller's sender.
+    #[cfg(test)]
+    pub fn detached(rx: Receiver<RunUpdate>) -> Self {
+        Self { rx, child: None }
+    }
+}
+
 /// Spawn ffmpeg to render `project` and return a channel of updates.
 ///
 /// `ffmpeg` is the program to invoke (a bare `"ffmpeg"` resolves via PATH).
@@ -54,7 +82,7 @@ pub fn run(
     ffmpeg: &str,
     project: &Project,
     overwrite: bool,
-) -> Result<Receiver<RunUpdate>, String> {
+) -> Result<RunHandle, String> {
     // Pre-check existence ourselves (the UI will confirm before calling us).
     if !overwrite && project.output.exists() {
         return Err(format!(
@@ -90,7 +118,7 @@ pub fn run_raw(
     ffmpeg: &str,
     user_args: Vec<String>,
     duration: Option<f64>,
-) -> Result<Receiver<RunUpdate>, String> {
+) -> Result<RunHandle, String> {
     if user_args.is_empty() {
         return Err("the edited command is empty".into());
     }
@@ -107,7 +135,7 @@ pub fn run_raw(
 /// Render a preview clip from `Project::preview_args`. The clip goes to a
 /// throwaway temp path, so `-y` is always safe; `len` is the clip length, which
 /// is what ffmpeg's `out_time` counts toward.
-pub fn run_preview(ffmpeg: &str, preview_args: Vec<String>, len: f64) -> Result<Receiver<RunUpdate>, String> {
+pub fn run_preview(ffmpeg: &str, preview_args: Vec<String>, len: f64) -> Result<RunHandle, String> {
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -133,6 +161,26 @@ pub fn open_in_default_app(path: &std::path::Path) -> Result<(), String> {
         .map_err(|e| format!("could not open {}: {e}", path.display()))
 }
 
+/// Open Explorer on `path`'s folder with the file selected. Fire-and-forget,
+/// like [`open_in_default_app`].
+#[cfg(windows)]
+pub fn show_in_folder(path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    // `/select,<path>` must reach Explorer as one argument, unquoted after the
+    // comma; Rust's own quoting would wrap the whole thing and break it.
+    Command::new("explorer")
+        .raw_arg(format!("/select,\"{}\"", path.display()))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open the folder of {}: {e}", path.display()))
+}
+
+/// Non-Windows fallback: open the containing folder without selecting.
+#[cfg(not(windows))]
+pub fn show_in_folder(path: &std::path::Path) -> Result<(), String> {
+    open_in_default_app(path.parent().unwrap_or(path))
+}
+
 /// Non-Windows fallback, unused by the shipped build.
 #[cfg(not(windows))]
 pub fn open_in_default_app(path: &std::path::Path) -> Result<(), String> {
@@ -146,7 +194,7 @@ pub fn open_in_default_app(path: &std::path::Path) -> Result<(), String> {
 /// Launch ffmpeg with the fully-assembled `args` and stream updates back.
 /// Shared by [`run`] (model-driven), [`run_raw`] (escape hatch) and
 /// [`run_preview`].
-fn spawn(ffmpeg: &str, args: Vec<String>, duration: Option<f64>) -> Result<Receiver<RunUpdate>, String> {
+fn spawn(ffmpeg: &str, args: Vec<String>, duration: Option<f64>) -> Result<RunHandle, String> {
     let mut cmd = Command::new(ffmpeg);
     cmd.args(&args)
         .stdin(Stdio::null())
@@ -154,7 +202,7 @@ fn spawn(ffmpeg: &str, args: Vec<String>, duration: Option<f64>) -> Result<Recei
         .stderr(Stdio::piped());
     no_window(&mut cmd);
 
-    let mut child = cmd
+    let mut child: Child = cmd
         .spawn()
         .map_err(|e| format!("could not launch ffmpeg (`{ffmpeg}`): {e}"))?;
 
@@ -164,6 +212,8 @@ fn spawn(ffmpeg: &str, args: Vec<String>, duration: Option<f64>) -> Result<Recei
     // Drain stderr on its own thread so a full pipe can't deadlock the child.
     let stderr_handle = thread::spawn(move || read_to_lines(stderr));
 
+    let child = Arc::new(Mutex::new(child));
+    let waiter = Arc::clone(&child);
     let (tx, rx) = channel();
     thread::spawn(move || {
         // Forward every progress block as it arrives.
@@ -172,13 +222,17 @@ fn spawn(ffmpeg: &str, args: Vec<String>, duration: Option<f64>) -> Result<Recei
         });
 
         // stdout closed → the process is finishing; collect its verdict.
-        let status = child.wait();
+        // Locked only now, so `RunHandle::cancel` can kill it while it runs.
+        let status = match waiter.lock() {
+            Ok(mut child) => child.wait(),
+            Err(_) => Err(std::io::Error::other("the run lock was poisoned")),
+        };
         let stderr_lines = stderr_handle.join().unwrap_or_default();
         let result = match status {
             Ok(s) if s.success() => Ok(()),
             Ok(s) => Err(RunFailure {
                 code: s.code(),
-                stderr_tail: tail(&stderr_lines, 20),
+                stderr_tail: tail(&stderr_lines, 200),
             }),
             Err(e) => Err(RunFailure {
                 code: None,
@@ -188,7 +242,7 @@ fn spawn(ffmpeg: &str, args: Vec<String>, duration: Option<f64>) -> Result<Recei
         let _ = tx.send(RunUpdate::Finished { result });
     });
 
-    Ok(rx)
+    Ok(RunHandle { rx, child: Some(child) })
 }
 
 /// Probe a binary by running `<program> -version`, returning its first line
