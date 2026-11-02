@@ -34,3 +34,11 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# Headless rendering for the scripted demo-video recorder (`src/ui/demo.rs`):
+# kittest's wgpu renderer turns egui frames into images, and its AccessKit tree
+# finds widgets by label so the script can click them.
+[dev-dependencies]
+egui_kittest = { version = "0.35", features = ["wgpu"] }
+egui-wgpu = "0.35"
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -30,6 +30,8 @@
 
 mod command;
 mod cues;
+#[cfg(test)]
+mod demo;
 mod drop;
 mod inspector;
 mod load;
