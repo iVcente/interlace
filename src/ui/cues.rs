@@ -474,9 +474,11 @@ fn cue_row(ui: &mut Ui, cue: &Cue, i: usize, offset: f64, selected: bool, can_pl
     if !ui.is_rect_visible(rect) {
         return resp.clicked().then_some(CueAction::Pick(i));
     }
-    // By pointer position, not `hovered()`: the ▶ button on top takes the
-    // hover, and the row must not lose its hover state (and the button) to it.
-    let hovered = ui.rect_contains_pointer(rect);
+    // Not by pointer position alone: the scroll bar floats over the rows and
+    // would count as hovering them. But the ▶ button on top takes the hover
+    // from the row, which must not lose its hover state (and the button) to it.
+    let play_id = egui::Id::new("cue_play").with(i);
+    let hovered = resp.hovered() || ui.ctx().read_response(play_id).is_some_and(|play| play.hovered());
     let fill = if selected {
         theme::SELECTED
     } else if hovered {
@@ -506,7 +508,7 @@ fn cue_row(ui: &mut Ui, cue: &Cue, i: usize, offset: f64, selected: bool, can_pl
 
     let mut action = None;
     if hovered {
-        let play = ui.interact(play_rect, egui::Id::new("cue_play").with(i), egui::Sense::click());
+        let play = ui.interact(play_rect, play_id, egui::Sense::click());
         let stroke = if play.hovered() { theme::ACCENT } else { theme::BUTTON_STROKE };
         ui.painter()
             .rect(play_rect, CornerRadius::same(4), theme::BUTTON, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);

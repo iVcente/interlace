@@ -1734,6 +1734,44 @@ mod tests {
         }
     }
 
+    /// The ▶ button follows the row under the pointer and survives the pointer
+    /// moving onto it, but the scroll bar floating over the rows hovers none.
+    #[test]
+    fn cue_play_button_ignores_the_scroll_bar() {
+        let mut app = app_with_demo();
+        let row = push_embedded_sub(&mut app);
+        app.selection.set_single(row);
+        let cues = (0..200)
+            .map(|i| crate::subs::Cue { start_secs: f64::from(i), end_secs: f64::from(i) + 1.0, text: "Line".into() })
+            .collect();
+        app.cues = Some(cues::CueView::ready(PathBuf::from("subs.srt"), 0, cues));
+        let ctx = test_ctx();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let play = egui::Id::new("cue_play").with(0);
+
+        // Later frames settle the layout, so measure the row only after them.
+        for _ in 0..3 {
+            let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| app.render(ui));
+        }
+        let cue_row = ctx.read_response(egui::Id::new("cue_row").with(0)).expect("the first cue row").rect;
+
+        let mut shown_with_pointer_at = |x: f32| {
+            for _ in 0..4 {
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![egui::Event::PointerMoved(egui::pos2(x, cue_row.center().y))],
+                    ..Default::default()
+                };
+                let _ = ctx.run_ui(input, |ui| app.render(ui));
+            }
+            ctx.read_response(play).is_some()
+        };
+
+        assert!(!shown_with_pointer_at(cue_row.right() - 2.0), "pointer on the scroll bar");
+        assert!(shown_with_pointer_at(cue_row.left() + 50.0), "pointer on the row");
+        assert!(shown_with_pointer_at(cue_row.right() - 20.0), "pointer on the button");
+    }
+
     /// Preview tests the selected track, or else the cue card's track.
     #[test]
     fn preview_subject_prefers_selection_then_cue_card() {
