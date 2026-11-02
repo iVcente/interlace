@@ -632,7 +632,7 @@ impl InterlaceApp {
             .resizable(true)
             .show_separator_line(false) // keep the drag, drop the visible line
             .default_size(if wide { 440.0 } else { 320.0 })
-            .size_range(260.0..=460.0)
+            .size_range(260.0..=inspector_max_width(ui.ctx().content_rect().width()))
             .frame(gutter(0, g, g, g))
             .show(ui, |ui| {
                 ui.set_style(saved.clone()); // the contents keep the real style
@@ -942,6 +942,13 @@ fn failure_line(f: &run::RunFailure) -> String {
     }
 }
 
+/// How wide the inspector may be dragged in a window this wide. egui only limits
+/// a panel to the window, so this is what keeps half the window for the table;
+/// the 460 floor keeps small windows' existing range.
+fn inspector_max_width(window_width: f32) -> f32 {
+    (window_width * 0.5).max(460.0)
+}
+
 /// A binary's last probe result in Settings: version, error, or "not checked".
 fn binary_status(ui: &mut egui::Ui, status: &Result<String, String>) {
     ui.horizontal(|ui| {
@@ -1126,6 +1133,12 @@ mod tests {
 
         assert!(harness.state().0.editing_output);
         assert!(harness.ctx.memory(|m| m.has_focus(egui::Id::new("output_path_edit"))));
+    }
+
+    #[test]
+    fn inspector_may_take_half_of_a_large_window() {
+        assert_eq!(inspector_max_width(1916.0), 958.0);
+        assert_eq!(inspector_max_width(800.0), 460.0);
     }
 
     /// Clicking the output path swaps a painted field for a real text edit, so
