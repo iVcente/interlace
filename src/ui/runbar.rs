@@ -257,6 +257,9 @@ fn output_field(ui: &mut Ui, app: &mut InterlaceApp, width: f32) {
     if resp.clicked() {
         app.editing_output = true;
         ui.memory_mut(|m| m.request_focus(id));
+        // Redraw before this frame ends: the edit that now has focus isn't in it
+        // yet, and AccessKit panics on a focused node missing from its tree.
+        ui.ctx().request_discard("the output path became a text edit");
     }
 }
 

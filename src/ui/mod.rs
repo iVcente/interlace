@@ -1088,6 +1088,46 @@ mod tests {
         app
     }
 
+    /// The harness keeps a live AccessKit tree, as a screen reader does, and
+    /// that tree panics if a frame ends focused on a widget it doesn't contain.
+    #[test]
+    fn clicking_the_output_path_focuses_its_edit() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = Harness::builder().with_size(egui::vec2(1440.0, 810.0)).with_max_steps(1).build_ui_state(
+            |ui, (app, ready): &mut (InterlaceApp, bool)| {
+                // The first frame only installs the theme, as `medium` must exist before `render`.
+                if *ready {
+                    app.render(ui);
+                } else {
+                    theme::install(ui.ctx(), false);
+                    *ready = true;
+                }
+            },
+            (app_with_demo(), false),
+        );
+        harness.step();
+
+        let label = harness.query_all_by(|n| n.value().as_deref() == Some("OUTPUT")).next().expect("the OUTPUT label").rect();
+        let pos = egui::pos2(label.max.x + 100.0, label.center().y);
+        harness.input_mut().events.push(egui::Event::PointerMoved(pos));
+        harness.step();
+        for pressed in [true, false] {
+            harness.input_mut().events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+        harness.step();
+
+        assert!(harness.state().0.editing_output);
+        assert!(harness.ctx.memory(|m| m.has_focus(egui::Id::new("output_path_edit"))));
+    }
+
     #[test]
     fn renders_without_panicking() {
         let mut app = app_with_demo();

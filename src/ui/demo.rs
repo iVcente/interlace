@@ -1203,11 +1203,6 @@ fn script(rec: &mut Recorder) {
     // 09 · Hints
     rec.caption("09 · HINTS", "Hints, not gates.", "Aim for MP4 and interlace explains what won't fit, before ffmpeg fails.");
     rec.wait(0.5);
-    // Clicking the output path swaps it for a text edit and focuses that in
-    // the same frame, before the edit exists; kittest's AccessKit tree rejects
-    // a focus on a missing node. Swapping a frame early looks the same.
-    rec.move_to(px(1500.0, 845.0));
-    rec.app().editing_output = true;
     rec.click(px(1500.0, 845.0)); // the output path
     rec.key(egui::Key::End);
     for _ in 0..3 {
