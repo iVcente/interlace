@@ -1,4 +1,4 @@
-//! Interlace — a focused GUI wrapper around ffmpeg/ffprobe for remuxing media.
+//! interlace — a focused GUI wrapper around ffmpeg/ffprobe for remuxing media.
 //!
 //! By default this launches the egui/eframe UI (milestone 3+). The logic-core
 //! CLI harness from milestones 1–2 is preserved behind flags:

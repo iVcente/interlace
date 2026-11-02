@@ -22,4 +22,4 @@
 .DS_Store
 Thumbs.db
 
-# Note: Cargo.lock IS committed — Interlace is a binary application.
+# Note: Cargo.lock IS committed — interlace is a binary application.

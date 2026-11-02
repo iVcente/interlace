@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Interlace is a Rust (edition 2024) desktop GUI, built on eframe/egui 0.35, for remuxing media through `ffmpeg`/`ffprobe`. It does not bundle those binaries. It looks them up on `PATH`, or uses paths set in the in-app ⚙ panel. The app is Windows-first: it is packaged and tested only on Windows.
+interlace is a Rust (edition 2024) desktop GUI, built on eframe/egui 0.35, for remuxing media through `ffmpeg`/`ffprobe`. It does not bundle those binaries. It looks them up on `PATH`, or uses paths set in the in-app ⚙ panel. The app is Windows-first: it is packaged and tested only on Windows.
 
 ## Commands
 
