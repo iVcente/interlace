@@ -216,7 +216,8 @@ fn output_row(ui: &mut Ui, app: &mut InterlaceApp, act: &mut Actions) {
 
 /// The output path. At rest it's drawn as a field that keeps the *end* of the
 /// path visible (the file name is what matters), with the full path on hover;
-/// a click turns it into a text edit until it loses focus.
+/// a click turns it into a text edit until it loses focus. Both forms center the
+/// text vertically, so it stays put across the swap.
 fn output_field(ui: &mut Ui, app: &mut InterlaceApp, width: f32) {
     let id = egui::Id::new("output_path_edit");
     let Some(project) = &mut app.project else {
@@ -235,7 +236,10 @@ fn output_field(ui: &mut Ui, app: &mut InterlaceApp, width: f32) {
         let mut text = project.output.display().to_string();
         let resp = ui.add_sized(
             vec2(width, 26.0),
-            egui::TextEdit::singleline(&mut text).id(id).margin(Margin::symmetric(8, 4)),
+            egui::TextEdit::singleline(&mut text)
+                .id(id)
+                .margin(Margin::symmetric(8, 4))
+                .vertical_align(egui::Align::Center),
         );
         if resp.changed() {
             project.output = text.into();

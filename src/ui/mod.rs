@@ -1128,6 +1128,39 @@ mod tests {
         assert!(harness.ctx.memory(|m| m.has_focus(egui::Id::new("output_path_edit"))));
     }
 
+    /// Clicking the output path swaps a painted field for a real text edit, so
+    /// nothing but this keeps the two drawing the text in the same place.
+    #[test]
+    fn clicking_the_output_path_does_not_move_its_text() {
+        /// Draws one frame and returns the top-left corner of the output path's text.
+        fn text_pos(ctx: &egui::Context, app: &mut InterlaceApp) -> egui::Pos2 {
+            let path = app.project.as_ref().unwrap().output.display().to_string();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 810.0))),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(input, |ui| app.render(ui));
+            out.shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == path => Some(text.pos + text.galley.rect.min.to_vec2()),
+                    _ => None,
+                })
+                .expect("the output path's text")
+        }
+
+        let ctx = test_ctx();
+        let mut app = app_with_demo();
+        let resting = text_pos(&ctx, &mut app);
+
+        app.editing_output = true;
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("output_path_edit")));
+        text_pos(&ctx, &mut app);
+        let editing = text_pos(&ctx, &mut app);
+
+        assert_eq!(resting, editing);
+    }
+
     #[test]
     fn renders_without_panicking() {
         let mut app = app_with_demo();
