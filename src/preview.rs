@@ -7,8 +7,9 @@
 //! things differ on purpose:
 //! - The output is always a temp `.mkv`: Matroska takes every codec, so a preview
 //!   never fails on a container mismatch the validation hints already flag.
-//! - The stream under test is the only stream of its kind in the clip, so the
-//!   player can't open on another track (see `focused`).
+//! - Audio and subtitles are each narrowed to the track under test, so the player
+//!   can't open on another one (see `focused`). The two kinds are chosen
+//!   independently: one track, or left out.
 //! - Video is re-encoded (fast, ≤ 720p) so it starts exactly at the start time
 //!   rather than at the next keyframe (`args::PREVIEW_VIDEO`).
 //!
@@ -46,40 +47,102 @@ pub fn sweep_temp() {
     }
 }
 
-/// The project to preview: a copy of `project` where the stream under test is
-/// the *only* stream of its kind (the others are left unmapped) and is marked
-/// default. Players pick tracks by their own rules — the first track, or a
-/// preferred language (MPC-HC) that an untagged added `.srt` never matches — so
-/// leaving the player no other choice is the only reliable way to show it.
-///
-/// The stream under test is `selected` if it's a live audio/subtitle stream;
-/// otherwise the first such stream with a sync offset, since
-/// checking that offset is what a preview is usually for.
-pub fn focused(project: &Project, selected: Option<usize>) -> Project {
-    let mut clip = project.clone();
-    let Some(focus) = focus(project, selected) else { return clip };
+/// What a preview does with one kind of track.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TrackPick {
+    /// Only this track. Named by input path and source index because rows
+    /// move; `copy` tells apart converted copies of one source stream.
+    Track { input: PathBuf, index: usize, copy: usize },
+    /// Leave this kind out of the clip.
+    Off,
+}
 
-    let kind = clip.streams[focus].source.kind;
-    for (i, s) in clip.streams.iter_mut().enumerate() {
-        if s.source.kind == kind {
-            s.removed = i != focus; // unmapped by `to_args`
-            s.meta.default = i == focus;
+impl TrackPick {
+    /// A pin on `streams[row]`.
+    pub fn track(project: &Project, row: usize) -> Self {
+        let source = &project.streams[row].source;
+        let input = &project.inputs[source.input].path;
+        let copy = (0..row).filter(|&i| is_stream(project, i, input, source.index)).count();
+        Self::Track { input: input.clone(), index: source.index, copy }
+    }
+
+    /// The live row this pins, if it pins one and that row is still live.
+    pub fn row(&self, project: &Project) -> Option<usize> {
+        let Self::Track { input, index, copy } = self else { return None };
+        (0..project.streams.len())
+            .filter(|&i| is_stream(project, i, input, *index))
+            .nth(*copy)
+            .filter(|&i| !project.streams[i].removed)
+    }
+}
+
+/// Whether `streams[row]` comes from source stream `index` of the input at `input`.
+fn is_stream(project: &Project, row: usize, input: &std::path::Path, index: usize) -> bool {
+    let source = &project.streams[row].source;
+    source.index == index && project.inputs[source.input].path == input
+}
+
+/// The pick a kind starts from, and returns to when its track goes away: what a
+/// player would open on, so the clip matches the output. That's the live track
+/// flagged default; failing that, the first audio track, or no subtitles.
+fn default_pick(project: &Project, kind: Kind) -> TrackPick {
+    let live = |i: &usize| project.streams[*i].source.kind == kind && !project.streams[*i].removed;
+    let mut rows = (0..project.streams.len()).filter(live);
+    let row = rows
+        .clone()
+        .find(|&i| project.streams[i].meta.default)
+        .or_else(|| if kind == Kind::Audio { rows.next() } else { None });
+    row.map_or(TrackPick::Off, |row| TrackPick::track(project, row))
+}
+
+/// The preview's choice for each kind of track it narrows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackPicks {
+    pub audio: TrackPick,
+    pub subtitle: TrackPick,
+}
+
+impl TrackPicks {
+    /// The picks a freshly opened `project` starts from.
+    pub fn initial(project: &Project) -> Self {
+        Self { audio: default_pick(project, Kind::Audio), subtitle: default_pick(project, Kind::Subtitle) }
+    }
+
+    /// Point `streams[row]`'s kind at it. Video has no pick, so it changes nothing.
+    pub fn select(&mut self, project: &Project, row: usize) {
+        let pick = TrackPick::track(project, row);
+        match project.streams[row].source.kind {
+            Kind::Audio => self.audio = pick,
+            Kind::Subtitle => self.subtitle = pick,
+            _ => {}
+        }
+    }
+
+    /// Reset any pick whose track was deleted or marked for removal.
+    pub fn prune(&mut self, project: &Project) {
+        for (kind, pick) in [(Kind::Audio, &mut self.audio), (Kind::Subtitle, &mut self.subtitle)] {
+            if matches!(pick, TrackPick::Track { .. }) && pick.row(project).is_none() {
+                *pick = default_pick(project, kind);
+            }
+        }
+    }
+}
+
+/// The project to preview: a copy of `project` where the picked track is the
+/// *only* one of its kind (the others are left unmapped) and marked default.
+/// Players pick tracks by their own rules — the first track, or a preferred
+/// language (MPC-HC) that an untagged added `.srt` never matches — so leaving the
+/// player no other choice is the only reliable way to show it.
+pub fn focused(project: &Project, picks: &TrackPicks) -> Project {
+    let mut clip = project.clone();
+    for (kind, pick) in [(Kind::Audio, &picks.audio), (Kind::Subtitle, &picks.subtitle)] {
+        let row = pick.row(project);
+        for (i, s) in clip.streams.iter_mut().enumerate().filter(|(_, s)| s.source.kind == kind) {
+            s.removed = row != Some(i); // unmapped by `to_args`
+            s.meta.default = row == Some(i);
         }
     }
     clip
-}
-
-/// The stream a preview tests: `selected` if it's a live audio/subtitle stream,
-/// otherwise the first such stream with a sync offset. `None` previews every
-/// track as it is. Shared by `focused` and the run card's "Testing …" line.
-pub fn focus(project: &Project, selected: Option<usize>) -> Option<usize> {
-    let testable = |i: usize| {
-        let s = &project.streams[i];
-        !s.removed && matches!(s.source.kind, Kind::Audio | Kind::Subtitle)
-    };
-    selected
-        .filter(|&i| i < project.streams.len() && testable(i))
-        .or_else(|| (0..project.streams.len()).find(|&i| testable(i) && project.streams[i].has_offset()))
 }
 
 /// Parse a start time typed by the user: `ss`, `mm:ss` or `hh:mm:ss`, each with
@@ -161,38 +224,79 @@ mod tests {
             .collect()
     }
 
+    /// The picked tracks are the only ones of their kinds, each marked default.
     #[test]
-    fn focused_keeps_only_the_stream_under_test_of_its_kind() {
-        let p = focused(&project(), Some(2));
-        assert_eq!(layout(&p), [(0, true), (2, true), (3, false)]);
+    fn focused_keeps_only_the_picked_tracks() {
+        let p = project();
+        let picks = TrackPicks { audio: TrackPick::track(&p, 2), subtitle: TrackPick::track(&p, 3) };
+        assert_eq!(layout(&focused(&p, &picks)), [(0, true), (2, true), (3, true)]);
     }
 
     #[test]
-    fn focused_leaves_video_and_no_focus_alone() {
-        let original = layout(&project());
-        for focus in [None, Some(0), Some(99)] {
-            assert_eq!(layout(&focused(&project(), focus)), original, "{focus:?}");
-        }
+    fn focused_leaves_out_a_kind_set_to_off() {
+        let p = project();
+        let picks = TrackPicks { audio: TrackPick::track(&p, 1), subtitle: TrackPick::Off };
+        assert_eq!(layout(&focused(&p, &picks)), [(0, true), (1, true)]);
     }
 
-    /// With nothing testable selected, an offset input's stream is the one under
-    /// test: an embedded `.srt` replaces the file's own subtitle in the clip.
+    /// A new project starts from the tracks a player would open on: the flagged
+    /// audio, or else the first; a subtitle only if one is flagged.
     #[test]
-    fn focused_falls_back_to_a_stream_with_an_offset() {
+    fn initial_picks_use_the_default_flags() {
         let mut p = project();
-        p.inputs.push(Input::new(PathBuf::from("subs.srt")));
-        let mut sub = stream(0, Kind::Subtitle, false);
-        sub.source.input = 1;
-        sub.offset_secs = 2.0;
-        p.streams.push(sub);
+        let picks = TrackPicks::initial(&p);
+        assert_eq!(picks.audio, TrackPick::track(&p, 1));
+        assert_eq!(picks.subtitle, TrackPick::Off);
 
-        let clip = focused(&p, Some(0)); // video selected: not testable
-        let subs: Vec<(usize, bool)> = clip
-            .streams
-            .iter()
-            .filter(|s| s.source.kind == Kind::Subtitle && !s.removed)
-            .map(|s| (s.source.input, s.meta.default))
-            .collect();
-        assert_eq!(subs, [(1, true)]);
+        p.streams[1].meta.default = false;
+        p.streams[2].meta.default = true;
+        p.streams[3].meta.default = true;
+        let picks = TrackPicks::initial(&p);
+        assert_eq!(picks.audio, TrackPick::track(&p, 2));
+        assert_eq!(picks.subtitle, TrackPick::track(&p, 3));
+
+        p.streams[2].meta.default = false;
+        assert_eq!(TrackPicks::initial(&p).audio, TrackPick::track(&p, 1), "first audio");
+    }
+
+    /// Selecting sets only the stream's own kind, and video sets nothing.
+    #[test]
+    fn select_sets_only_its_own_kind() {
+        let p = project();
+        let mut picks = TrackPicks::initial(&p);
+        picks.select(&p, 0);
+        assert_eq!(picks, TrackPicks::initial(&p));
+        picks.select(&p, 3);
+        assert_eq!(picks.subtitle, TrackPick::track(&p, 3));
+        assert_eq!(picks.audio, TrackPick::track(&p, 1));
+    }
+
+    /// A pick follows its track when rows move, and tells converted copies of one
+    /// source stream apart.
+    #[test]
+    fn a_pick_names_its_track_across_reorders_and_copies() {
+        let mut p = project();
+        let pick = TrackPick::track(&p, 2);
+        p.streams.swap(1, 2);
+        assert_eq!(pick.row(&p), Some(1));
+
+        p.streams.push(stream(2, Kind::Audio, false));
+        let copy = TrackPick::track(&p, 4);
+        assert_eq!(copy.row(&p), Some(4));
+        assert_eq!(pick.row(&p), Some(1));
+    }
+
+    /// A pick on a track marked for removal resets, and None stays None.
+    #[test]
+    fn prune_resets_a_dead_pick() {
+        let mut p = project();
+        let mut picks = TrackPicks { audio: TrackPick::track(&p, 2), subtitle: TrackPick::Off };
+        picks.prune(&p);
+        assert_eq!(picks.audio, TrackPick::track(&p, 2));
+
+        p.streams[2].removed = true;
+        picks.prune(&p);
+        assert_eq!(picks.audio, TrackPick::track(&p, 1));
+        assert_eq!(picks.subtitle, TrackPick::Off);
     }
 }

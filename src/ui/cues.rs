@@ -3,11 +3,14 @@
 //! around: read the lines, click one, preview a clip, nudge the offset, preview
 //! again.
 //!
-//! It stays on the stream it was opened for, named in its header, rather than
-//! following the table selection: loading means ffmpeg reading the whole file,
-//! too slow to repeat on every click. Cues load once per stream on a background
-//! thread (`subs::read_cues`), polled each frame like a run, and are cached for
-//! the session so reopening any stream already read is instant.
+//! It belongs to the selected stream: selecting anything else hides it, and it
+//! never opens by itself on a stream, since loading means ffmpeg reading the
+//! whole file, too slow to repeat on every click. Each stream opened keeps its
+//! own view (load, filter, picked cue, open or not), so reselecting one brings
+//! its card back exactly as it was, even if its load finished meanwhile. Cues
+//! load once per stream on a background thread (`subs::read_cues`), polled each
+//! frame like a run, and are cached for the session so reopening any stream
+//! already read is instant.
 //!
 //! A view is keyed by its input's *path* and the stream's source index, not by
 //! row or input index: rows move on reorder and input indices shift when an
@@ -47,7 +50,7 @@ pub(crate) enum CueLoad {
     Failed(String),
 }
 
-/// The open (or last opened) cue card.
+/// One stream's cue card, shown while that stream is the selected one.
 pub(crate) struct CueView {
     /// Path of the input the stream belongs to.
     pub(crate) input: PathBuf,
@@ -56,7 +59,8 @@ pub(crate) struct CueView {
     pub(crate) load: CueLoad,
     /// Case- and accent-insensitive text filter over the cues.
     filter: String,
-    /// Whether the card is shown; closing it keeps the loaded cues for reopening.
+    /// Whether the card shows while this stream is selected; closing it keeps
+    /// the loaded cues for reopening.
     pub(crate) open: bool,
     /// The clicked cue (index into the loaded cues).
     pub(crate) selected: Option<usize>,
@@ -123,74 +127,85 @@ impl CueView {
 }
 
 impl InterlaceApp {
-    /// Open the cue card on `streams[idx]`. Reopening the stream it already
-    /// shows just shows it again; a stream read earlier this session comes from
-    /// the cache; anything else (or a failed load) reads the file.
+    /// Open the cue card on `streams[idx]`. A stream with a view just shows it
+    /// again; a stream read earlier this session comes from the cache; anything
+    /// else (or a failed load) reads the file.
     pub(crate) fn open_cues(&mut self, idx: usize) {
         let Some(project) = &self.project else { return };
         let Some(stream) = project.streams.get(idx) else { return };
         let input = project.inputs[stream.source.input].path.clone();
         let index = stream.source.index;
-        if let Some(view) = &mut self.cues
-            && view.is_for(&input, index)
-            && !matches!(view.load, CueLoad::Failed(_))
-        {
-            view.open = true;
-            return;
+        if let Some(view) = self.cue_view_of(idx) {
+            if !matches!(self.cues[view].load, CueLoad::Failed(_)) {
+                self.cues[view].open = true;
+                return;
+            }
+            self.cues.remove(view);
         }
         let load = match self.cue_cache.get(&(input.clone(), index)) {
             Some(cues) => CueLoad::Ready(Arc::clone(cues)),
             None => CueLoad::Loading(subs::read_cues(&self.ffmpeg, &input, index)),
         };
-        self.cues = Some(CueView::new(input, index, load));
+        self.cues.push(CueView::new(input, index, load));
     }
 
-    /// Whether the cue card is open on `streams[idx]` (the inspector's View cues
+    /// The position in `cues` of `streams[idx]`'s view, if it has one.
+    fn cue_view_of(&self, idx: usize) -> Option<usize> {
+        let project = self.project.as_ref()?;
+        let stream = project.streams.get(idx)?;
+        let input = &project.inputs[stream.source.input].path;
+        self.cues.iter().position(|view| view.is_for(input, stream.source.index))
+    }
+
+    /// Whether `streams[idx]`'s cue card is open (the inspector's View cues
     /// button then reads Hide cues).
     pub(crate) fn cues_show(&self, idx: usize) -> bool {
-        let (Some(project), Some(view)) = (&self.project, &self.cues) else { return false };
-        view.open && view.row(project) == Some(idx)
+        self.cue_view_of(idx).is_some_and(|view| self.cues[view].open)
     }
 
-    /// The row the open cue card shows, if any.
+    /// The row whose cue card is showing: the single selected stream, if its
+    /// card is open.
     pub(crate) fn cue_row(&self) -> Option<usize> {
-        let (Some(project), Some(view)) = (&self.project, &self.cues) else { return None };
-        view.open.then(|| view.row(project)).flatten()
+        self.selection.single().filter(|&idx| self.cues_show(idx))
     }
 
-    /// Close the cue card, keeping its loaded cues for a quick reopen.
+    /// Close the showing cue card, keeping its loaded cues for a quick reopen.
     pub(crate) fn close_cues(&mut self) {
-        if let Some(view) = &mut self.cues {
-            view.open = false;
+        if let Some(view) = self.cue_row().and_then(|row| self.cue_view_of(row)) {
+            self.cues[view].open = false;
         }
     }
 
-    /// Re-read the cue card's stream after a failed load.
-    fn retry_cues(&mut self) {
-        let Some(view) = &self.cues else { return };
-        let rx = subs::read_cues(&self.ffmpeg, &view.input, view.stream_index);
-        if let Some(view) = &mut self.cues {
-            view.load = CueLoad::Loading(rx);
-        }
+    /// Re-read the stream of `cues[view]` after a failed load.
+    fn retry_cues(&mut self, view: usize) {
+        let view = &mut self.cues[view];
+        view.load = CueLoad::Loading(subs::read_cues(&self.ffmpeg, &view.input, view.stream_index));
     }
 }
 
-/// Per-frame upkeep, whether or not the card is shown: take a finished load,
-/// and drop the view once its stream is no longer in the project (another file
-/// loaded, or the inserted track deleted).
+/// Per-frame upkeep, whether or not a card is shown: drop views whose stream is
+/// no longer in the project (another file loaded, or the inserted track
+/// deleted), and take finished loads, including those of unselected streams.
 pub(super) fn poll(ctx: &egui::Context, app: &mut InterlaceApp) {
     let Some(project) = &app.project else {
-        app.cues = None;
+        app.cues.clear();
         return;
     };
-    let Some(view) = &mut app.cues else { return };
-    if view.row(project).is_none() {
-        app.cues = None;
-        return;
+    app.cues.retain(|view| view.row(project).is_some());
+    let mut loading = false;
+    for view in &mut app.cues {
+        loading |= view.poll(&mut app.cue_cache);
     }
-    if view.poll(&mut app.cue_cache) {
+    if loading {
         ctx.request_repaint();
     }
+    // One card replacing another keeps its rect but not its scroll area's id,
+    // which debug builds would outline for a frame. Redraw before showing it.
+    let row = app.cue_row();
+    if row.is_some() && app.prev_cue_row.is_some() && row != app.prev_cue_row {
+        ctx.request_discard("the cue card switched streams");
+    }
+    app.prev_cue_row = row;
 }
 
 /// The START field's flash strength now, `1.0` right after a cue click fading
@@ -209,7 +224,7 @@ pub(super) fn start_flash(ctx: &egui::Context, app: &InterlaceApp) -> f32 {
 
 /// Whether the cue card should be stacked under the inspector this frame.
 pub(super) fn is_open(app: &InterlaceApp) -> bool {
-    app.cues.as_ref().is_some_and(|v| v.open)
+    app.cue_row().is_some()
 }
 
 /// What a click in the card asked for, applied after drawing.
@@ -225,9 +240,10 @@ enum CueAction {
 pub(super) fn panel(ui: &mut Ui, app: &mut InterlaceApp, height: f32) {
     let hint = app.start_flash.is_none(); // until the first cue click this session
     let can_play = app.preview_blocker().is_none();
+    let Some(row) = app.cue_row() else { return };
+    let Some(view_at) = app.cue_view_of(row) else { return };
     let Some(project) = &mut app.project else { return };
-    let Some(view) = &mut app.cues else { return };
-    let Some(row) = view.row(project) else { return };
+    let view = &mut app.cues[view_at];
     let mut close = false;
     let mut retry = false;
     let mut action: Option<CueAction> = None;
@@ -262,7 +278,8 @@ pub(super) fn panel(ui: &mut Ui, app: &mut InterlaceApp, height: f32) {
                         view.filter.clear();
                     }
                 } else {
-                    action = cue_list(ui, &cues, &shown, offset, view.selected, can_play);
+                    let scroll_id = egui::Id::new(("cue_rows", &view.input, view.stream_index));
+                    action = cue_list(ui, scroll_id, &cues, &shown, offset, view.selected, can_play);
                 }
             }
         }
@@ -272,7 +289,7 @@ pub(super) fn panel(ui: &mut Ui, app: &mut InterlaceApp, height: f32) {
         view.open = false;
     }
     if retry {
-        app.retry_cues();
+        app.retry_cues(view_at);
         return;
     }
     // A clicked cue becomes the preview start, with a short lead-in so the line
@@ -282,7 +299,7 @@ pub(super) fn panel(ui: &mut Ui, app: &mut InterlaceApp, height: f32) {
         None => return,
     };
     let i = *i;
-    let Some(view) = &mut app.cues else { return };
+    let view = &mut app.cues[view_at];
     let CueLoad::Ready(cues) = &view.load else { return };
     let offset = app.project.as_ref().map_or(0.0, |p| p.streams[row].offset_secs);
     view.selected = Some(i);
@@ -440,8 +457,10 @@ fn failed(ui: &mut Ui, error: &str) -> bool {
 }
 
 /// The virtualized cue rows under a divider, filling the rest of the card.
+/// `scroll_id` names the stream, so each one keeps its own scroll position.
 fn cue_list(
     ui: &mut Ui,
+    scroll_id: egui::Id,
     cues: &[Cue],
     shown: &[usize],
     offset: f64,
@@ -452,7 +471,7 @@ fn cue_list(
     ui.painter().rect_filled(rule, 0.0, theme::SECTION_DIVIDER);
     let mut action = None;
     egui::ScrollArea::vertical()
-        .id_salt("cue_rows")
+        .id_salt(scroll_id)
         .auto_shrink([false, false])
         .show_rows(ui, ROW_HEIGHT, shown.len(), |ui, range| {
             ui.spacing_mut().item_spacing.y = 0.0;

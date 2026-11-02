@@ -8,7 +8,7 @@
 //! - `inspector`: the right-hand card editing the selected streams
 //! - `cues`: the subtitle cue card, stacked under the inspector when open
 //! - `command`: the optional, resizable command card under the table
-//! - `runbar`: the bottom card (Run, output path, progress, preview row)
+//! - `runbar`: the bottom cards (preview clip; Run, output path, progress)
 //!
 //! Layout follows the "floating cards" design: every panel is transparent with
 //! an 8 px gutter as its margin, and draws its own rounded card inside, so cards
@@ -62,7 +62,7 @@ pub(crate) enum JobKind {
     /// writes, when known, for the "Wrote …" line and Show in folder.
     Run { output: Option<PathBuf> },
     /// A preview clip, opened in the default player once rendered.
-    Preview { clip: PathBuf, start: f64, len: f64 },
+    Preview { clip: PathBuf, len: f64 },
 }
 
 /// One ffmpeg job, running or finished.
@@ -141,15 +141,25 @@ pub struct InterlaceApp {
     /// mirrors `to_args()` live); `Some` means the user has edited it, so Run
     /// executes this text verbatim instead. Reset to `None` on load or "Reset".
     pub(crate) command_edit: Option<String>,
-    /// The subtitle cue viewer (`cues.rs`); `None` until one is opened. Kept when
-    /// its card closes so reopening the same stream needn't re-read the file.
-    pub(crate) cues: Option<cues::CueView>,
+    /// One cue view (`cues.rs`) per stream whose cues were opened. Kept while
+    /// their cards are hidden, so going back to a stream restores its card as it
+    /// was without re-reading the file.
+    pub(crate) cues: Vec<cues::CueView>,
+    /// The row whose cue card last frame showed, to notice one card replacing
+    /// another (see `cues::poll`).
+    pub(crate) prev_cue_row: Option<usize>,
     /// The preview clip's start time as typed (`hh:mm:ss`, `mm:ss` or seconds),
     /// in output time. Kept as text so a half-typed value isn't reformatted under
     /// the cursor; clicking a cue in the viewer writes it.
     pub(crate) preview_start: String,
     /// The preview clip's length in seconds, one of `preview::LENGTHS`.
     pub(crate) preview_len: f64,
+    /// Which audio and subtitle tracks the preview uses (the run card's
+    /// dropdowns). `None` until the next frame works them out for a new project.
+    pub(crate) preview_picks: Option<crate::preview::TrackPicks>,
+    /// The stream that last set a dropdown from the table. Named rather than by
+    /// row, so a reorder doesn't count as selecting it again over the user's pick.
+    prev_preview_subject: Option<crate::preview::TrackPick>,
     /// Every preview clip rendered this session, deleted when the app closes.
     preview_clips: Vec<PathBuf>,
     pub(crate) ffprobe: String,
@@ -210,7 +220,10 @@ impl InterlaceApp {
             run_state: RunState::Idle,
             pending_run: None,
             command_edit: None,
-            cues: None,
+            cues: Vec::new(),
+            prev_cue_row: None,
+            preview_picks: None,
+            prev_preview_subject: None,
             preview_start: "00:00:00".into(),
             preview_len: 30.0,
             preview_clips: Vec::new(),
@@ -266,7 +279,8 @@ impl InterlaceApp {
         self.error = None;
         self.run_state = RunState::Idle;
         self.command_edit = None; // a new file starts from the model
-        self.cues = None;
+        self.cues.clear();
+        self.preview_picks = None;
     }
 
     /// Embed an external audio/subtitle track from `path` as a new input of the
@@ -291,7 +305,8 @@ impl InterlaceApp {
             self.project = None;
             self.selection.clear();
             self.command_edit = None;
-            self.cues = None;
+            self.cues.clear();
+            self.preview_picks = None;
             format!("Closed {name}")
         } else {
             let Some(p) = &mut self.project else { return };
@@ -484,24 +499,41 @@ impl InterlaceApp {
         }
     }
 
-    /// The stream a preview should test: the single selected stream when it's a
-    /// live audio/subtitle track, else the track the cue card shows (so playing
-    /// a cue tests that track even with something else selected). `None` lets
-    /// `preview::focus` fall back to a track with an offset.
+    /// The stream that sets a preview dropdown: the single selected stream when
+    /// it's a live audio/subtitle track. The cue card needs no case of its own,
+    /// as it only shows for the selected stream.
     pub(crate) fn preview_subject(&self) -> Option<usize> {
         let project = self.project.as_ref()?;
-        let testable = |i: usize| {
+        self.selection.single().filter(|&i| {
             project.streams.get(i).is_some_and(|s| {
                 !s.removed && matches!(s.source.kind, crate::model::Kind::Audio | crate::model::Kind::Subtitle)
             })
-        };
-        self.selection.single().filter(|&i| testable(i)).or_else(|| self.cue_row().filter(|&i| testable(i)))
+        })
+    }
+
+    /// Per-frame upkeep of the preview dropdowns: start a new project's, reset any
+    /// whose track went away, and point one at a stream newly selected in the
+    /// table, so viewing a track's cues previews that track. It acts only on a
+    /// change of selection, leaving what the user picks in a dropdown alone.
+    fn update_preview_picks(&mut self) {
+        use crate::preview::{TrackPick, TrackPicks};
+        let subject = self.preview_subject();
+        let Some(project) = &self.project else { return };
+        let picks = self.preview_picks.get_or_insert_with(|| TrackPicks::initial(project));
+        picks.prune(project);
+        let named = subject.map(|row| TrackPick::track(project, row));
+        if named != self.prev_preview_subject {
+            if let Some(row) = subject {
+                picks.select(project, row);
+            }
+            self.prev_preview_subject = named;
+        }
     }
 
     /// Render a `preview_len`-second clip of the current project from
-    /// `preview_start` and open it in the default player when it's done. The
-    /// single selected audio/subtitle stream is made the default of its kind so
-    /// the player starts on it (see `preview::focused`).
+    /// `preview_start` and open it in the default player when it's done. Audio
+    /// and subtitles are narrowed to the tracks under test so the player starts
+    /// on them (see `preview::focused`).
     pub(crate) fn start_preview(&mut self) {
         if self.preview_blocker().is_some() {
             return;
@@ -510,12 +542,13 @@ impl InterlaceApp {
         else {
             return;
         };
-        let clip = crate::preview::focused(project, self.preview_subject());
+        let picks = self.preview_picks.clone().unwrap_or_else(|| crate::preview::TrackPicks::initial(project));
+        let clip = crate::preview::focused(project, &picks);
         let out = crate::preview::next_path();
         let args = clip.preview_args(start, self.preview_len, &out);
         self.preview_clips.push(out.clone());
         self.error = None;
-        let job = Job::new(JobKind::Preview { clip: out, start, len: self.preview_len });
+        let job = Job::new(JobKind::Preview { clip: out, len: self.preview_len });
         self.run_state = run_state_from(run::run_preview(&self.ffmpeg, args, self.preview_len), job);
     }
 
@@ -557,7 +590,7 @@ impl InterlaceApp {
             return;
         };
         let outcome = finish(&job, result);
-        self.run_state = RunState::Done { job, outcome };
+        self.run_state = settled(job, outcome);
     }
 
     // --- frame ---------------------------------------------------------------
@@ -568,6 +601,7 @@ impl InterlaceApp {
         self.poll_run(ui.ctx());
         load::poll(ui.ctx(), self);
         cues::poll(ui.ctx(), self);
+        self.update_preview_picks();
 
         // Files dropped onto the window this frame. Entries without a path (web
         // drops carrying only bytes) and folders have nothing for ffprobe to read.
@@ -932,7 +966,18 @@ fn run_state_from(result: Result<RunHandle, String>, job: Job) -> RunState {
     }
 }
 
-/// The run card's one-line failure: exit code plus ffmpeg's last stderr line,
+/// The state a finished job leaves. A preview that opened or was cancelled says
+/// so by the player appearing or not, and a lasting message would keep hiding the
+/// track dropdowns it shares a row with, which the next preview may well change.
+fn settled(job: Job, outcome: Outcome) -> RunState {
+    match outcome {
+        Outcome::PreviewOpened => RunState::Idle,
+        Outcome::Cancelled if job.is_preview() => RunState::Idle,
+        outcome => RunState::Done { job, outcome },
+    }
+}
+
+/// The one-line failure on the run and preview cards: exit code plus ffmpeg's last stderr line,
 /// which is almost always the actual error.
 fn failure_line(f: &run::RunFailure) -> String {
     let last = f.stderr_tail.lines().last().unwrap_or("ffmpeg failed");
@@ -1433,7 +1478,7 @@ mod tests {
     fn reshaping_changes_do_not_flash() {
         let changes: Vec<Box<dyn Fn(&mut InterlaceApp)>> = vec![
             Box::new(|app| {
-                app.selection.set_single(3);
+                app.selection.set_single(app.project.as_ref().unwrap().streams.len() - 1);
                 open_ready_cues(app);
             }),
             Box::new(|app| app.selection.set_many([1, 2, 3])),
@@ -1562,8 +1607,12 @@ mod tests {
             }),
             Box::new(|| RunState::Done { job: run(), outcome: Outcome::Cancelled }),
             Box::new(|| {
-                let job = Job::new(JobKind::Preview { clip: PathBuf::from("clip.mkv"), start: 93.6, len: 30.0 });
+                let job = Job::new(JobKind::Preview { clip: PathBuf::from("clip.mkv"), len: 30.0 });
                 run_state_from(Ok(RunHandle::detached(std::sync::mpsc::channel().1)), job)
+            }),
+            Box::new(|| RunState::Done {
+                job: Job::new(JobKind::Preview { clip: PathBuf::from("clip.mkv"), len: 30.0 }),
+                outcome: Outcome::Failed { message: "ffmpeg exited with code 1: boom".into(), log: "boom".into() },
             }),
         ];
         for state in states {
@@ -1572,6 +1621,18 @@ mod tests {
             app.show_log = true;
             render_at(&mut app, 1000.0, 650.0);
         }
+    }
+
+    /// A preview leaves a message only when it failed; a run always reports.
+    #[test]
+    fn only_a_failed_preview_leaves_a_message() {
+        let preview = || Job::new(JobKind::Preview { clip: PathBuf::from("c.mkv"), len: 10.0 });
+        let failed = || Outcome::Failed { message: "boom".into(), log: "boom".into() };
+        assert!(matches!(settled(preview(), Outcome::PreviewOpened), RunState::Idle));
+        assert!(matches!(settled(preview(), Outcome::Cancelled), RunState::Idle));
+        assert!(matches!(settled(preview(), failed()), RunState::Done { .. }));
+        let run = || Job::new(JobKind::Run { output: None });
+        assert!(matches!(settled(run(), Outcome::Cancelled), RunState::Done { .. }));
     }
 
     /// A real run locks the inspector and blocks a second job; a preview
@@ -1584,7 +1645,7 @@ mod tests {
         assert!(app.run_state.is_main_running());
         assert!(app.run_blocker().is_some());
 
-        let job = Job::new(JobKind::Preview { clip: PathBuf::from("c.mkv"), start: 0.0, len: 10.0 });
+        let job = Job::new(JobKind::Preview { clip: PathBuf::from("c.mkv"), len: 10.0 });
         app.run_state = run_state_from(Ok(RunHandle::detached(std::sync::mpsc::channel().1)), job);
         assert!(!app.run_state.is_main_running());
         assert!(app.run_blocker().is_some());
@@ -1666,7 +1727,93 @@ mod tests {
             crate::subs::Cue { start_secs: 1.0, end_secs: 2.0, text: "Hello\nthere".into() },
             crate::subs::Cue { start_secs: 3.0, end_secs: 4.0, text: "Bye".into() },
         ];
-        app.cues = Some(cues::CueView::ready(PathBuf::from("subs.srt"), 0, cues));
+        app.cues = vec![cues::CueView::ready(PathBuf::from("subs.srt"), 0, cues)];
+    }
+
+    /// Reselecting a stream brings its card back as it was, with no reload; any
+    /// other stream (with no card of its own), or several at once, hides it.
+    #[test]
+    fn cue_card_follows_the_selected_stream() {
+        let mut app = app_with_demo();
+        let row = push_embedded_sub(&mut app);
+        open_ready_cues(&mut app);
+        app.cues[0].selected = Some(1);
+
+        app.selection.set_single(row);
+        assert_eq!(app.cue_row(), Some(row));
+
+        for other in 0..row {
+            app.selection.set_single(other);
+            assert_eq!(app.cue_row(), None, "row {other} has no card");
+        }
+        app.selection.set_many([0, row]);
+        assert_eq!(app.cue_row(), None, "several streams selected");
+
+        app.selection.set_single(row);
+        assert_eq!(app.cue_row(), Some(row));
+        assert_eq!(app.cues[0].selected, Some(1));
+        assert!(matches!(app.cues[0].load, cues::CueLoad::Ready(_)));
+
+        // A hidden card stays hidden on the way back.
+        app.close_cues();
+        app.selection.set_single(0);
+        app.selection.set_single(row);
+        assert_eq!(app.cue_row(), None);
+    }
+
+    /// Each stream opened keeps its own view side by side.
+    #[test]
+    fn each_stream_keeps_its_own_cue_view() {
+        let mut app = app_with_demo();
+        let first = push_embedded_sub(&mut app);
+        let second = push_embedded_sub(&mut app);
+        app.project.as_mut().unwrap().streams[second].source.index = 1;
+        let cue = crate::subs::Cue { start_secs: 1.0, end_secs: 2.0, text: "Hi".into() };
+        for index in [0, 1] {
+            app.cue_cache.insert((PathBuf::from("subs.srt"), index), std::sync::Arc::new(vec![cue.clone()]));
+        }
+        app.open_cues(first);
+        app.open_cues(second);
+        assert_eq!(app.cues.len(), 2);
+
+        app.selection.set_single(first);
+        assert_eq!(app.cue_row(), Some(first));
+        app.close_cues();
+        assert!(!app.cues_show(first));
+        assert!(app.cues_show(second), "closing one card leaves the other's alone");
+    }
+
+    /// Moving between two streams with open cards swaps the whole card in place,
+    /// which must not flash id-clash outlines on any frame.
+    #[test]
+    fn switching_cue_cards_does_not_flash() {
+        for (w, h) in [(1000.0, 650.0), (1600.0, 900.0)] {
+            let mut app = app_with_demo();
+            let first = push_embedded_sub(&mut app);
+            let second = push_embedded_sub(&mut app);
+            app.project.as_mut().unwrap().streams[second].source.index = 1;
+            let lines = |n: usize| {
+                (0..n)
+                    .map(|i| crate::subs::Cue { start_secs: i as f64, end_secs: i as f64 + 1.0, text: "Line".into() })
+                    .collect::<Vec<_>>()
+            };
+            app.cues = vec![
+                cues::CueView::ready(PathBuf::from("subs.srt"), 0, lines(100)),
+                cues::CueView::ready(PathBuf::from("subs.srt"), 1, lines(100)),
+            ];
+            let ctx = test_ctx();
+            let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
+            let input = || egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut reds = Vec::new();
+            for row in [first, second, 0, second, first] {
+                app.selection.set_single(row);
+                for _ in 0..3 {
+                    let out = ctx.run_ui(input(), |ui| app.render(ui));
+                    reds.push(out.shapes.iter().map(|s| count_red(&s.shape)).sum::<usize>());
+                }
+            }
+            assert!(reds.iter().all(|&r| r == 0), "{w}x{h}: red outlines per frame {reds:?}");
+        }
     }
 
     /// The cue window renders its rows (with an offset applied) and stays open
@@ -1682,7 +1829,7 @@ mod tests {
         for _ in 0..2 {
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
         }
-        assert!(app.cues.as_ref().is_some_and(|v| v.open));
+        assert_eq!(app.cue_row(), Some(row));
     }
 
     /// The preview is offered only for a loaded, model-driven project with a
@@ -1726,10 +1873,11 @@ mod tests {
         for view in views {
             for (w, h) in [(1000.0, 650.0), (1600.0, 900.0)] {
                 let mut app = app_with_demo();
-                push_embedded_sub(&mut app);
-                app.cues = Some(view());
+                let row = push_embedded_sub(&mut app);
+                app.selection.set_single(row);
+                app.cues = vec![view()];
                 render_at(&mut app, w, h);
-                assert!(app.cues.is_some(), "the card stays while its stream exists");
+                assert_eq!(app.cue_row(), Some(row), "the card stays while its stream exists");
             }
         }
     }
@@ -1744,7 +1892,7 @@ mod tests {
         let cues = (0..200)
             .map(|i| crate::subs::Cue { start_secs: f64::from(i), end_secs: f64::from(i) + 1.0, text: "Line".into() })
             .collect();
-        app.cues = Some(cues::CueView::ready(PathBuf::from("subs.srt"), 0, cues));
+        app.cues = vec![cues::CueView::ready(PathBuf::from("subs.srt"), 0, cues)];
         let ctx = test_ctx();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
         let play = egui::Id::new("cue_play").with(0);
@@ -1772,14 +1920,93 @@ mod tests {
         assert!(shown_with_pointer_at(cue_row.right() - 20.0), "pointer on the button");
     }
 
-    /// Preview tests the selected track, or else the cue card's track.
+    /// The preview row renders its dropdowns in each pick state and width, and
+    /// its reason line when a hand-edited command blocks previews.
     #[test]
-    fn preview_subject_prefers_selection_then_cue_card() {
+    fn renders_preview_pickers() {
+        use crate::preview::{TrackPick, TrackPicks};
+        for (w, h) in [(800.0, 600.0), (1600.0, 900.0)] {
+            let mut app = app_with_demo();
+            let row = push_embedded_sub(&mut app);
+            let project = app.project.as_ref().unwrap();
+            for picks in [
+                TrackPicks::initial(project),
+                TrackPicks { audio: TrackPick::Off, subtitle: TrackPick::track(project, row) },
+            ] {
+                app.preview_picks = Some(picks.clone());
+                render_at(&mut app, w, h);
+            }
+            app.command_edit = Some("ffmpeg -i in.mkv out.mkv".into());
+            render_at(&mut app, w, h);
+        }
+    }
+
+    /// Selecting a track in the table points its dropdown at it, leaving the other
+    /// kind's alone. A pick made in a dropdown then holds until the selection
+    /// changes, and removing the picked track resets it.
+    #[test]
+    fn preview_dropdowns_follow_table_selection_changes() {
+        use crate::preview::TrackPick;
         let mut app = app_with_demo();
-        let row = push_embedded_sub(&mut app);
+        let sub = push_embedded_sub(&mut app);
+        let track = |app: &InterlaceApp, row| TrackPick::track(app.project.as_ref().unwrap(), row);
+        app.selection.set_single(0); // video
+        render_at(&mut app, 1000.0, 650.0);
+        let audio = app.preview_picks.as_ref().unwrap().audio.clone();
+
+        app.selection.set_single(sub);
+        render_at(&mut app, 1000.0, 650.0);
+        assert_eq!(app.preview_picks.as_ref().unwrap().subtitle, track(&app, sub));
+        assert_eq!(app.preview_picks.as_ref().unwrap().audio, audio);
+
+        app.preview_picks.as_mut().unwrap().subtitle = TrackPick::Off;
+        render_at(&mut app, 1000.0, 650.0);
+        assert_eq!(app.preview_picks.as_ref().unwrap().subtitle, TrackPick::Off, "same selection");
+
+        app.selection.set_single(0);
+        render_at(&mut app, 1000.0, 650.0);
+        app.selection.set_single(sub);
+        render_at(&mut app, 1000.0, 650.0);
+        assert_eq!(app.preview_picks.as_ref().unwrap().subtitle, track(&app, sub), "selected again");
+
+        let removed = track(&app, sub);
+        app.remove_selected();
+        render_at(&mut app, 1000.0, 650.0);
+        assert_ne!(app.preview_picks.as_ref().unwrap().subtitle, removed);
+    }
+
+    /// The dropdown's text stays put as a row turns selected or hovered: egui's
+    /// selectable button adds its outline to the margin, moving the text.
+    #[test]
+    fn a_dropdown_row_keeps_its_text_in_place() {
+        let positions: Vec<egui::Pos2> = [false, true]
+            .into_iter()
+            .map(|on| {
+                let ctx = test_ctx();
+                let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    runbar::option_row(ui, "A0 · eng", on);
+                });
+                out.shapes
+                    .iter()
+                    .find_map(|clipped| match &clipped.shape {
+                        egui::Shape::Text(text) => Some(text.pos),
+                        _ => None,
+                    })
+                    .expect("the row's text")
+            })
+            .collect();
+        assert_eq!(positions[0], positions[1]);
+    }
+
+    /// Preview tests the selected track when it's testable, and the cue card of
+    /// a stream no longer selected has no say.
+    #[test]
+    fn preview_subject_is_the_selected_track() {
+        let mut app = app_with_demo();
+        push_embedded_sub(&mut app);
         open_ready_cues(&mut app);
         app.selection.set_single(0); // video: not testable
-        assert_eq!(app.preview_subject(), Some(row));
+        assert_eq!(app.preview_subject(), None);
         app.selection.set_single(1);
         assert_eq!(app.preview_subject(), Some(1));
     }
@@ -1791,8 +2018,9 @@ mod tests {
         let row = push_embedded_sub(&mut app);
         let cue = crate::subs::Cue { start_secs: 1.0, end_secs: 2.0, text: "Hi".into() };
         app.cue_cache.insert((PathBuf::from("subs.srt"), 0), std::sync::Arc::new(vec![cue]));
+        app.selection.set_single(row);
         app.open_cues(row);
-        assert!(matches!(app.cues.as_ref().unwrap().load, cues::CueLoad::Ready(_)));
+        assert!(matches!(app.cues[0].load, cues::CueLoad::Ready(_)));
         assert_eq!(app.cue_row(), Some(row));
     }
 
@@ -1806,7 +2034,7 @@ mod tests {
         app.remove_selected();
         let ctx = test_ctx();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
-        assert!(app.cues.is_none());
+        assert!(app.cues.is_empty());
     }
 
     /// An image-based subtitle selected renders the inspector's disabled

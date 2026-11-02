@@ -474,6 +474,34 @@ impl<'a> Recorder<'a> {
         (node.rect().center().to_vec2() / PPP).to_pos2()
     }
 
+    /// The center of the widget whose label contains all of `parts`, for a label
+    /// built from data, like a track's `A3 · file name`.
+    fn find_containing(&self, parts: &[&str]) -> Pos2 {
+        let node = self
+            .harness
+            .query_all_by(|n| n.label().is_some_and(|l| parts.iter().all(|p| l.contains(p))))
+            .next()
+            .unwrap_or_else(|| panic!("no widget labelled with {parts:?}"));
+        (node.rect().center().to_vec2() / PPP).to_pos2()
+    }
+
+    /// The rect of the static text `text` (labels report it as their value).
+    fn text_rect(&self, text: &str) -> Rect {
+        let node = self
+            .harness
+            .query_all_by(|n| n.value().as_deref() == Some(text))
+            .next()
+            .unwrap_or_else(|| panic!("no text {text:?}"));
+        let r = node.rect();
+        Rect::from_min_max((r.min.to_vec2() / PPP).to_pos2(), (r.max.to_vec2() / PPP).to_pos2())
+    }
+
+    /// The center of the painted widget with the explicit id `id`, for rows that
+    /// carry no label, whose place depends on the layout.
+    fn widget_center(&self, id: egui::Id) -> Pos2 {
+        self.harness.ctx.read_response(id).expect("the widget was drawn").rect.center()
+    }
+
     /// Click the widget labelled `label`.
     fn click_label(&mut self, label: &str) {
         let p = self.find(label);
@@ -1181,29 +1209,44 @@ fn script(rec: &mut Recorder) {
     rec.click(px(640.0, 493.0)); // the pt-BR subtitle
     rec.wait(0.3);
     rec.click_label("View cues");
-    rec.wait_until(20.0, |a| a.cues.as_ref().is_some_and(|c| matches!(c.load, super::cues::CueLoad::Ready(_))));
+    rec.wait_until(20.0, |a| a.cues.iter().any(|c| matches!(c.load, super::cues::CueLoad::Ready(_))));
     rec.wait(1.0);
     rec.still("s8-cues");
     rec.wait_until(10.0, |a| a.toast.is_none());
-    rec.click(px(1530.0, 729.0)); // the 00:01:05 cue
+    let cue = rec.widget_center(egui::Id::new("cue_row").with(3)); // the 00:01:05 cue
+    rec.click(cue);
     rec.wait(1.0);
-    // Ten − steps of 0.05 s: half a second earlier.
-    rec.click(px(1359.0, 541.0));
+    // Ten − steps of 0.05 s: half a second earlier. The − sits right of the card's OFFSET label.
+    let offset = rec.text_rect("OFFSET");
+    rec.click(pos2(offset.left() + 74.0, offset.center().y));
     for _ in 1..10 {
         rec.button(true);
         rec.wait(0.06);
         rec.button(false);
         rec.wait(0.1);
     }
-    rec.wait(0.6);
-    rec.move_to(rec.find("Preview"));
     rec.wait(1.2);
     rec.still("s8-synced");
 
-    // 09 · Hints
-    rec.caption("09 · HINTS", "Hints, not gates.", "Aim for MP4 and interlace explains what won't fit, before ffmpeg fails.");
+    // 09 · Preview
+    rec.caption("09 · PREVIEW", "Check it in your player first.", "Clicking the subtitle set its dropdown; pick the audio to hear it with and render a clip.");
+    rec.wait(0.6);
+    let audio = rec.text_rect("AUDIO");
+    rec.click(pos2(audio.right() + 90.0, audio.center().y));
+    rec.wait(0.8);
+    rec.still("s9-pickers");
+    let dub = rec.find_containing(&["A", " · ", "es-419"]);
+    rec.click(dub);
+    rec.wait(0.6);
+    rec.move_to(rec.find("Preview"));
+    rec.wait(1.4);
+    rec.still("s9-picked");
+
+    // 10 · Hints
+    rec.caption("10 · HINTS", "Hints, not gates.", "Aim for MP4 and interlace explains what won't fit, before ffmpeg fails.");
     rec.wait(0.5);
-    rec.click(px(1500.0, 845.0)); // the output path
+    let output = rec.text_rect("OUTPUT");
+    rec.click(pos2(output.right() + 300.0, output.center().y)); // the output path
     rec.key(egui::Key::End);
     for _ in 0..3 {
         rec.key(egui::Key::Backspace);
@@ -1211,7 +1254,7 @@ fn script(rec: &mut Recorder) {
     }
     rec.type_text("mp4");
     rec.wait(2.2);
-    rec.still("s9-hints");
+    rec.still("s10-hints");
     for _ in 0..3 {
         rec.key(egui::Key::Backspace);
         rec.wait(0.06);
@@ -1220,15 +1263,15 @@ fn script(rec: &mut Recorder) {
     rec.key(egui::Key::Enter);
     rec.wait(0.8);
 
-    // 10 · Run
-    rec.caption("10 · RUN", "One click. Seconds, not hours.", "Stream copy rewraps without re-encoding. Progress, speed and Cancel while it runs.");
+    // 11 · Run
+    rec.caption("11 · RUN", "One click. Seconds, not hours.", "Stream copy rewraps without re-encoding. Progress, speed and Cancel while it runs.");
     rec.wait(0.4);
     rec.click_label("Run");
     rec.fast_forward = 2;
     rec.wait_until(300.0, |a| matches!(a.run_state, super::RunState::Done { .. }));
     rec.fast_forward = 1;
     rec.wait(2.0);
-    rec.still("s10-done");
+    rec.still("s11-done");
     rec.wait(1.0);
 
     rec.show_card(card(

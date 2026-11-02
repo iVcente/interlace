@@ -27,8 +27,14 @@ your streams in seconds without re-encoding. Only audio conversion re-encodes.
 - **Subtitle cues**: list a text subtitle's lines with their times (offset
   included), filter them, and click one to jump the preview there.
 - **Preview clips**: render 10, 30 or 60 seconds of the real output from any
-  start time and open it in your default player. The track you're testing is
-  the only one of its kind in the clip, so the player can't pick another.
+  start time and open it in your default player. Choose the clip's audio and
+  subtitle track from its dropdowns, or None to leave one out; selecting a track
+  in the table sets its dropdown too. Those are the only tracks of their kinds in
+  the clip, so the player can't pick another.
+
+A stream's cue list opens from its inspector and belongs to it: it hides when you
+select something else, and comes back as you left it, without reading the file
+again, when you return.
 
 Together that's one quick loop: read the lines, click one, preview, nudge the
 offset, preview again.
@@ -67,12 +73,15 @@ can't be found, a banner says so and links straight to Settings.
 2. Insert extra tracks with **+ Audio** / **+ Subtitle**, or drop them in.
 3. Edit: drag rows to reorder, click a row to edit it in the inspector on the
    right, use **Remove** / **Extract to file…** at its bottom.
-4. Check the output path in the bottom bar, then press **Run**. If the output
-   exists you'll be asked before it's overwritten.
+4. Check a stretch of the result from the **Preview** card at the bottom if you
+   like. Its start time, length and tracks only shape that temporary clip.
+5. Check the output path in the **Run** card under it, then press **Run**. If the
+   output exists you'll be asked before it's overwritten.
 
 Wide windows (1400 px and up) split the table into codec, language, title and
 source columns, and add a stream-details section to the inspector. The
-inspector and the command panel can both be resized by dragging their edges.
+inspector (up to half of a large window) and the command panel can both be
+resized by dragging their edges.
 
 ### Command-line
 

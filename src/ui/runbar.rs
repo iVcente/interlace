@@ -1,20 +1,24 @@
-//! The run card at the bottom: two rows in a three-column grid (buttons ·
-//! labels · content).
+//! The two cards at the bottom, each in a three-column grid (button · label ·
+//! content). They're separate because the preview's settings only shape the temp
+//! clip, and side by side they read as settings of the export.
 //!
-//! Row 1 is the run itself. Idle, it shows the OUTPUT path with a browse
-//! button; running, a progress bar with percent, elapsed time and speed (Run
-//! turns into Cancel); finished, one line saying what was written or why it
-//! failed, with Show in folder or View log. Messages are always one truncated
-//! line, so nothing overlaps the bar.
+//! The run card shows the OUTPUT path with a browse button; running, a progress
+//! bar with percent, elapsed time and speed (Run turns into Cancel); finished,
+//! one line saying what was written or why it failed, with Show in folder or
+//! View log. Messages are always one truncated line, so nothing overlaps the bar.
 //!
-//! Row 2 is the preview clip: a START time, a 10/30/60 s length, and a line
-//! naming the track under test (or why Preview is unavailable). Run and Preview
-//! share the one ffmpeg slot, so each disables the other; a rendering preview
-//! reports its progress in row 1 under a PREVIEW label.
+//! The preview card, above it because previewing comes first, has a START time,
+//! a 10/30/60 s length, and a dropdown each for the clip's audio and subtitle
+//! track. Its own progress or failure takes the dropdowns' place, as does the
+//! reason when Preview is unavailable. An invalid START keeps the dropdowns,
+//! since half-typed times shouldn't make the row jump; the field turns red and
+//! the button's hover says why. Run and Preview share the one ffmpeg slot, so
+//! each disables the other.
 
 use super::widgets::{self, line};
 use super::{InterlaceApp, JobKind, Outcome, RunState, format_offset, pick_output_file, short_name, theme};
-use crate::preview;
+use crate::model::{Kind, Project};
+use crate::preview::{self, TrackPick};
 use egui::{Color32, CornerRadius, Margin, RichText, Stroke, Ui, vec2};
 use egui_phosphor::regular as icon;
 
@@ -38,19 +42,11 @@ struct Actions {
 
 pub(super) fn show(ui: &mut Ui, app: &mut InterlaceApp) {
     let mut act = Actions::default();
-    widgets::card(ui, Margin::symmetric(12, 8), |ui| {
-        ui.spacing_mut().item_spacing = vec2(COL_GAP, 6.0);
-        ui.horizontal(|ui| {
-            ui.set_height(ROW_HEIGHT);
-            run_row(ui, app, &mut act);
-        });
-        if app.project.is_some() {
-            ui.horizontal(|ui| {
-                ui.set_height(ROW_HEIGHT);
-                preview_row(ui, app, &mut act);
-            });
-        }
-    });
+    ui.spacing_mut().item_spacing.y = theme::GUTTER;
+    if app.project.is_some() {
+        card_row(ui, |ui| preview_row(ui, app, &mut act));
+    }
+    card_row(ui, |ui| run_row(ui, app, &mut act));
 
     if act.run {
         app.on_run_clicked();
@@ -81,8 +77,33 @@ pub(super) fn show(ui: &mut Ui, app: &mut InterlaceApp) {
     }
 }
 
-/// Row 1: Run (or Cancel), then the output path, progress, or the last job's
-/// outcome.
+/// A card holding one grid row.
+fn card_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    widgets::card(ui, Margin::symmetric(12, 8), |ui| {
+        ui.spacing_mut().item_spacing = vec2(COL_GAP, 6.0);
+        ui.horizontal(|ui| {
+            ui.set_height(ROW_HEIGHT);
+            add(ui);
+        });
+    });
+}
+
+/// The row's trailing buttons, from the right: dismiss, then an optional `extra`
+/// as `(icon, label)`. Returns whether `extra` was clicked.
+fn trailing_buttons(ui: &mut Ui, act: &mut Actions, extra: Option<(&str, &str)>) -> bool {
+    let mut clicked = false;
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        act.dismiss = widgets::close_x(ui, 20.0, "Dismiss");
+        if let Some((glyph, label)) = extra {
+            clicked = ui.add(widgets::button(widgets::with_icon(glyph, label))).clicked();
+        }
+    });
+    clicked
+}
+
+/// Run (or Cancel), then the output path, progress, or the last run's outcome. A
+/// preview's progress and outcome stay in the preview card.
 fn run_row(ui: &mut Ui, app: &mut InterlaceApp, act: &mut Actions) {
     // The button.
     let main_running = app.run_state.is_main_running();
@@ -118,80 +139,37 @@ fn run_row(ui: &mut Ui, app: &mut InterlaceApp, act: &mut Actions) {
 
     // The rest of the row.
     match &app.run_state {
-        RunState::Running { job, fraction, speed, .. } => {
+        RunState::Running { job, fraction, speed, .. } if !job.is_preview() => {
             let elapsed = job.started.elapsed().as_secs();
-            let text = match &job.kind {
-                JobKind::Preview { len, .. } => {
-                    ui.add_sized(vec2(LABEL_COL, ROW_HEIGHT), egui::Label::new(widgets::caps("PREVIEW", theme::WEAK)));
-                    format!("{:.0}% · rendering {len} s clip", fraction * 100.0)
-                }
-                JobKind::Run { .. } => {
-                    let speed = speed.map(|s| format!(" · {s:.1}×")).unwrap_or_default();
-                    format!("{:.0}% · {:02}:{:02}{speed}", fraction * 100.0, elapsed / 60, elapsed % 60)
-                }
-            };
+            let speed = speed.map(|s| format!(" · {s:.1}×")).unwrap_or_default();
+            let text = format!("{:.0}% · {:02}:{:02}{speed}", fraction * 100.0, elapsed / 60, elapsed % 60);
             progress(ui, *fraction, &text);
         }
-        RunState::Done { job, outcome } => {
-            let right = |ui: &mut Ui, act: &mut Actions, extra: Option<(&str, &str)>| -> bool {
-                // Lays out the trailing buttons; returns whether the extra one was clicked.
-                let mut clicked = false;
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    act.dismiss = widgets::close_x(ui, 20.0, "Dismiss");
-                    if let Some((glyph, label)) = extra {
-                        clicked = ui.add(widgets::button(widgets::with_icon(glyph, label))).clicked();
+        RunState::Done { job, outcome } if !job.is_preview() => match outcome {
+            Outcome::Wrote { bytes, secs } => {
+                let output = match &job.kind {
+                    JobKind::Run { output } => output.clone(),
+                    JobKind::Preview { .. } => None,
+                };
+                let what = output.as_ref().map_or("the output".to_string(), |p| p.display().to_string());
+                let size = bytes.map(|b| format!(" · {}", human_size(b))).unwrap_or_default();
+                let text = format!("Wrote {what}{size} in {}", human_secs(*secs));
+                message(ui, icon::CHECK_CIRCLE, &text, theme::SUCCESS, |ui| {
+                    let extra = output.is_some().then_some((icon::FOLDER_OPEN, "Show in folder"));
+                    if trailing_buttons(ui, act, extra) {
+                        act.show_folder = output.clone();
                     }
                 });
-                clicked
-            };
-            match outcome {
-                Outcome::Wrote { bytes, secs } => {
-                    let output = match &job.kind {
-                        JobKind::Run { output } => output.clone(),
-                        JobKind::Preview { .. } => None,
-                    };
-                    let what = output.as_ref().map_or("the output".to_string(), |p| p.display().to_string());
-                    let size = bytes.map(|b| format!(" · {}", human_size(b))).unwrap_or_default();
-                    let text = format!("Wrote {what}{size} in {}", human_secs(*secs));
-                    message(ui, icon::CHECK_CIRCLE, &text, theme::SUCCESS, |ui| {
-                        let extra = output.is_some().then_some((icon::FOLDER_OPEN, "Show in folder"));
-                        if right(ui, act, extra) {
-                            act.show_folder = output.clone();
-                        }
-                    });
-                }
-                Outcome::PreviewOpened => {
-                    let (start, len) = match &job.kind {
-                        JobKind::Preview { start, len, .. } => (*start, *len),
-                        JobKind::Run { .. } => (0.0, 0.0),
-                    };
-                    let text = format!(
-                        "Preview opened in your default player · {}, {len} s",
-                        crate::subs::format_time(start)
-                    );
-                    message(ui, icon::CHECK_CIRCLE, &text, theme::SUCCESS, |ui| {
-                        right(ui, act, None);
-                    });
-                }
-                Outcome::Cancelled => {
-                    let text = if job.is_preview() {
-                        "Preview cancelled."
-                    } else {
-                        "Run cancelled. The output file may be incomplete."
-                    };
-                    message(ui, icon::INFO, text, theme::WEAK, |ui| {
-                        right(ui, act, None);
-                    });
-                }
-                Outcome::Failed { message: text, .. } => {
-                    message(ui, icon::X_CIRCLE, text, theme::ERROR, |ui| {
-                        act.view_log = right(ui, act, Some((icon::FILE_TEXT, "View log")));
-                    });
-                }
             }
-        }
-        RunState::Idle => match app.missing_binary().filter(|(name, ..)| *name == "ffmpeg") {
+            Outcome::Cancelled => {
+                message(ui, icon::INFO, "Run cancelled. The output file may be incomplete.", theme::WEAK, |ui| {
+                    trailing_buttons(ui, act, None);
+                });
+            }
+            Outcome::Failed { message: text, .. } => failure(ui, act, text),
+            Outcome::PreviewOpened => {} // never a run's outcome
+        },
+        _ => match app.missing_binary().filter(|(name, ..)| *name == "ffmpeg") {
             Some((name, tried, err)) => {
                 let text = format!("{name} not found — Tried {tried} — {err}. Set the path in Settings, or install ffmpeg and add it to PATH.");
                 message(ui, icon::X_CIRCLE, &text, theme::ERROR, |_| {});
@@ -325,7 +303,15 @@ fn message(ui: &mut Ui, glyph: &str, text: &str, color: Color32, trailing: impl 
     });
 }
 
-/// Row 2: Preview (or Cancel), START, the length switch, and what's tested.
+/// A failed job's one-line reason, with View log and dismiss.
+fn failure(ui: &mut Ui, act: &mut Actions, text: &str) {
+    message(ui, icon::X_CIRCLE, text, theme::ERROR, |ui| {
+        act.view_log = trailing_buttons(ui, act, Some((icon::FILE_TEXT, "View log")));
+    });
+}
+
+/// Preview (or Cancel), START, the length switch, then the track dropdowns, or
+/// the clip's progress, failure, or why it can't start.
 fn preview_row(ui: &mut Ui, app: &mut InterlaceApp, act: &mut Actions) {
     let preview_running = matches!(&app.run_state, RunState::Running { job, .. } if job.is_preview());
     let blocker = app.preview_blocker();
@@ -335,6 +321,10 @@ fn preview_row(ui: &mut Ui, app: &mut InterlaceApp, act: &mut Actions) {
     } else {
         let btn = widgets::button(widgets::with_icon(icon::FILM_SLATE, "Preview"));
         let resp = ui.add_enabled_ui(blocker.is_none(), |ui| ui.add_sized(vec2(BUTTON_COL, ROW_HEIGHT), btn)).inner;
+        let resp = match blocker {
+            Some(why) => resp.on_disabled_hover_text(why),
+            None => resp,
+        };
         act.preview = resp
             .on_hover_text("Render this stretch of the output to a temp file and open it in your player")
             .clicked();
@@ -367,7 +357,20 @@ fn preview_row(ui: &mut Ui, app: &mut InterlaceApp, act: &mut Actions) {
         .on_hover_text("Start time in the output: hh:mm:ss, mm:ss or seconds. Clicking a subtitle cue sets it.");
     });
     length_switch(ui, &mut app.preview_len);
-    info_line(ui, app, blocker);
+    match &app.run_state {
+        RunState::Running { job, fraction, .. } if job.is_preview() => {
+            let len = match &job.kind {
+                JobKind::Preview { len, .. } => *len,
+                JobKind::Run { .. } => 0.0,
+            };
+            progress(ui, *fraction, &format!("{:.0}% · rendering {len} s clip", fraction * 100.0));
+        }
+        RunState::Done { job, outcome: Outcome::Failed { message: text, .. } } if job.is_preview() => failure(ui, act, text),
+        _ => match blocker.filter(|_| valid) {
+            Some(why) => blocked_line(ui, why),
+            None => track_pickers(ui, app),
+        },
+    }
 }
 
 /// The `10 s | 30 s | 60 s` segmented control.
@@ -409,45 +412,89 @@ fn length_switch(ui: &mut Ui, len: &mut f64) {
         });
 }
 
-/// What the preview will test, or why it can't start.
-fn info_line(ui: &mut Ui, app: &InterlaceApp, blocker: Option<&str>) {
+/// Why the preview can't start, in place of the dropdowns.
+fn blocked_line(ui: &mut Ui, why: &str) {
     ui.spacing_mut().item_spacing.x = 0.0;
-    if let Some(why) = blocker {
-        let invalid_start = app.project.is_some()
-            && !app.run_state.is_running()
-            && app.command_edit.is_none()
-            && preview::parse_timestamp(&app.preview_start).is_none();
-        let (glyph, color) = if invalid_start { (icon::WARNING, theme::ERROR) } else { (icon::INFO, theme::WEAK) };
-        ui.label(RichText::new(format!("{glyph} ")).size(14.0).color(color));
-        line(ui, RichText::new(why).size(12.5).color(color));
-        return;
+    ui.label(RichText::new(format!("{} ", icon::INFO)).size(14.0).color(theme::WEAK));
+    line(ui, RichText::new(why).size(12.5).color(theme::WEAK));
+}
+
+/// The AUDIO and SUBTITLE dropdowns, sharing the rest of the row evenly.
+fn track_pickers(ui: &mut Ui, app: &mut InterlaceApp) {
+    let (Some(project), Some(picks)) = (&app.project, &mut app.preview_picks) else { return };
+    let labels = ui.painter().layout_no_wrap("AUDIOSUBTITLE".into(), egui::FontId::proportional(13.0), theme::WEAK).size().x;
+    let width = ((ui.available_width() - labels - 3.0 * COL_GAP) / 2.0).clamp(90.0, 340.0);
+    track_picker(ui, project, Kind::Audio, "AUDIO", &mut picks.audio, width);
+    track_picker(ui, project, Kind::Subtitle, "SUBTITLE", &mut picks.subtitle, width);
+}
+
+/// One kind's dropdown: each live track, then None. Selecting a track in the
+/// table sets it too (`InterlaceApp::update_preview_picks`).
+fn track_picker(ui: &mut Ui, project: &Project, kind: Kind, label: &str, pick: &mut TrackPick, width: f32) {
+    let name = |row: usize| {
+        let s = &project.streams[row];
+        let offset = if s.has_offset() { format!(" {}", format_offset(s.offset_secs)) } else { String::new() };
+        format!("{}{offset}", short_name(project, row))
+    };
+    let rows: Vec<usize> = (0..project.streams.len())
+        .filter(|&i| project.streams[i].source.kind == kind && !project.streams[i].removed)
+        .collect();
+    let (text, color) = match pick.row(project) {
+        Some(row) => (name(row), theme::TEXT),
+        None => ("None".to_string(), theme::WEAK),
+    };
+
+    ui.label(widgets::caps(label, theme::WEAK));
+    let mut picked = None;
+    let combo = super::inspector::field_combo(ui, |ui| {
+        ui.add_enabled_ui(!rows.is_empty(), |ui| {
+            egui::ComboBox::from_id_salt(("preview_track", label))
+                .width(width)
+                .truncate()
+                .selected_text(RichText::new(text).size(12.5).color(color))
+                .show_ui(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for &row in &rows {
+                        if option_row(ui, &name(row), pick.row(project) == Some(row)).clicked() {
+                            picked = Some(TrackPick::track(project, row));
+                        }
+                    }
+                    if option_row(ui, "None", *pick == TrackPick::Off).clicked() {
+                        picked = Some(TrackPick::Off);
+                    }
+                });
+        })
+    });
+    combo.response.on_hover_text("The track the clip uses. Selecting one in the table sets it too. None leaves this kind out of the clip.");
+    if let Some(new) = picked {
+        *pick = new;
     }
-    let Some(project) = &app.project else { return };
-    let mut job = egui::text::LayoutJob::default();
-    let fmt = |color| egui::TextFormat::simple(egui::FontId::proportional(12.5), color);
-    match preview::focus(project, app.preview_subject()) {
-        Some(idx) => {
-            let s = &project.streams[idx];
-            job.append(&format!("{} ", icon::TARGET), 0.0, egui::TextFormat::simple(egui::FontId::proportional(14.0), theme::CHANGE_OFFSET));
-            job.append("Testing ", 0.0, fmt(theme::WEAK));
-            job.append(&short_name(project, idx), 0.0, fmt(theme::TEXT));
-            if s.has_offset() {
-                job.append(
-                    &format_offset(s.offset_secs),
-                    6.0,
-                    egui::TextFormat::simple(egui::FontId::monospace(12.0), theme::CHANGE_OFFSET),
-                );
-            }
-            let others = if s.source.kind == crate::model::Kind::Audio { "other audio" } else { "other subtitles" };
-            job.append(&format!(" · {others} left out"), 0.0, fmt(theme::WEAK));
-        }
-        None => {
-            job.append(&format!("{} ", icon::INFO), 0.0, egui::TextFormat::simple(egui::FontId::proportional(14.0), theme::WEAK));
-            job.append("Select an audio or subtitle track to test it on its own", 0.0, fmt(theme::WEAK));
-        }
+}
+
+/// A dropdown row painted at a fixed size, like the length switch's segments: an
+/// `egui::Button` also sizes itself from its outline, so its text moves as it
+/// turns selected or hovered.
+pub(super) fn option_row(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), on, text));
+    if ui.is_rect_visible(rect) {
+        let (fill, stroke) = match (on, resp.hovered()) {
+            (true, _) => (theme::SELECTED, theme::ACCENT),
+            (false, true) => (theme::CARD, Color32::TRANSPARENT),
+            (false, false) => (Color32::TRANSPARENT, Color32::TRANSPARENT),
+        };
+        ui.painter()
+            .rect(rect, CornerRadius::same(4), fill, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        let mut job = egui::text::LayoutJob::single_section(
+            text.to_string(),
+            egui::TextFormat::simple(egui::FontId::proportional(12.5), theme::TEXT),
+        );
+        job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() - 16.0);
+        let galley = ui.painter().layout_job(job);
+        let pos = egui::pos2(rect.left() + 8.0, rect.center().y - galley.size().y / 2.0);
+        ui.painter().galley(pos, galley, theme::TEXT);
     }
-    job.wrap = egui::text::TextWrapping::truncate_at_width(ui.available_width());
-    ui.add(egui::Label::new(job));
+    resp
 }
 
 /// The View log window: the failed job's stderr, scrollable, with Copy.

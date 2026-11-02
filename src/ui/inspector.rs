@@ -411,7 +411,7 @@ fn language_label(code: &str) -> String {
 
 /// Draw combos in this scope as fields (`FIELD` fill, `STROKE` outline) rather
 /// than buttons, matching the mockup's selects.
-fn field_combo<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+pub(super) fn field_combo<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.scope(|ui| {
         let w = &mut ui.visuals_mut().widgets;
         w.inactive.weak_bg_fill = theme::FIELD;
