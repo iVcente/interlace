@@ -15,9 +15,9 @@
 //! A view is keyed by its input's *path* and the stream's source index, not by
 //! row or input index: rows move on reorder and input indices shift when an
 //! inserted track is pruned, but the path/index pair keeps naming the same
-//! stream. The card's OFFSET stepper edits that stream's `offset_secs`, the
-//! same field as the inspector's SYNC OFFSET, and displayed times add it, so
-//! they match what the output will contain.
+//! stream. Displayed times add the stream's `offset_secs`, edited by the
+//! inspector's SYNC OFFSET right above this card, so they match what the output
+//! will contain.
 //!
 //! Clicking a cue sets the preview START 2 s before it (and flashes the field);
 //! its ▶ button does the same and starts the preview right away.
@@ -235,14 +235,15 @@ enum CueAction {
     Play(usize),
 }
 
-/// The cue card, filling `height`: header, OFFSET, filter, hint, then the list
-/// (or the loading / failed / no-match state).
+/// The cue card, filling `height`: header, filter, hint, then the list (or the
+/// loading / failed / no-match state).
 pub(super) fn panel(ui: &mut Ui, app: &mut InterlaceApp, height: f32) {
     let hint = app.start_flash.is_none(); // until the first cue click this session
     let can_play = app.preview_blocker().is_none();
     let Some(row) = app.cue_row() else { return };
     let Some(view_at) = app.cue_view_of(row) else { return };
-    let Some(project) = &mut app.project else { return };
+    let Some(project) = &app.project else { return };
+    let offset = project.streams[row].offset_secs;
     let view = &mut app.cues[view_at];
     let mut close = false;
     let mut retry = false;
@@ -251,18 +252,6 @@ pub(super) fn panel(ui: &mut Ui, app: &mut InterlaceApp, height: f32) {
     widgets::card_fill(ui, height, Margin::symmetric(12, 10), |ui| {
         ui.spacing_mut().item_spacing.y = 8.0;
         header(ui, project, row, &mut close);
-
-        let offset = &mut project.streams[row].offset_secs;
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(vec2(52.0, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.set_min_size(vec2(52.0, 22.0));
-                widgets::section_label(ui, "OFFSET");
-            });
-            widgets::offset_stepper(ui, offset, true);
-            ui.add_space(4.0);
-            line(ui, RichText::new("times include it").size(12.0).color(theme::WEAK));
-        });
-        let offset = *offset;
 
         match &view.load {
             CueLoad::Loading(_) => loading(ui),

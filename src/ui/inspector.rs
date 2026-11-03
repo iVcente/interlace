@@ -3,10 +3,12 @@
 //! table rows and inspector are the same objects shown two ways.
 //!
 //! The card fills its column: a header naming the selection, then TAGS,
-//! CONVERSION, SYNC OFFSET (and STREAM DETAILS on wide windows) in a scroll
-//! area, and a footer pinned to the bottom with View cues, Extract and Remove.
+//! CONVERSION (and STREAM DETAILS on wide windows) in a scroll area, and a footer
+//! pinned to the bottom with SYNC OFFSET over View cues, Extract and Remove.
 //! Pinning the footer keeps the actions in one place however long the sections
-//! get, including when the cue card halves the column.
+//! get, including when the cue card halves the column. SYNC OFFSET is pinned
+//! because it's the cue card's only offset control: the read, nudge, preview
+//! loop needs it on screen beside the cues, where the sections have little room.
 //!
 //! It works over the whole selection: one selected stream is just the N = 1 case
 //! of the batch form. Each field shows the value every selected stream shares,
@@ -144,10 +146,14 @@ pub(super) fn show(ui: &mut Ui, app: &mut InterlaceApp, height: f32, wide: bool)
                 footer(ui, project, &rows, cues_on_selected, &mut deferred);
             });
             ui.add_space(12.0);
+            ui.scope_builder(scope("inspector_offset", egui::Layout::bottom_up(egui::Align::Min)), |ui| {
+                offset_section(ui, project, &rows);
+            });
             ui.scope_builder(scope("inspector_sections", egui::Layout::top_down(egui::Align::Min)), |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("inspector_scroll")
                     .auto_shrink([false, false])
+                    .min_scrolled_height(0.0) // the default would overflow onto SYNC OFFSET in a short column
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         sections(ui, project, &rows, wide, &mut deferred);
@@ -180,12 +186,11 @@ pub(super) fn show(ui: &mut Ui, app: &mut InterlaceApp, height: f32, wide: bool)
     }
 }
 
-/// The scrolling middle of the card: TAGS, CONVERSION, SYNC OFFSET and, on
-/// wide windows, STREAM DETAILS, divided by thin rules.
+/// The scrolling middle of the card: TAGS, CONVERSION and, on wide windows,
+/// STREAM DETAILS, divided by thin rules.
 fn sections(ui: &mut Ui, project: &mut Project, rows: &[usize], wide: bool, deferred: &mut Deferred) {
     tags_section(ui, project, rows);
     conversion_section(ui, project, rows, deferred);
-    offset_section(ui, project, rows);
     if wide && let [idx] = rows {
         details_section(ui, project, *idx);
     }
@@ -649,26 +654,25 @@ fn offset_section(ui: &mut Ui, project: &mut Project, rows: &[usize]) {
     if !matches!(stream.source.kind, Kind::Audio | Kind::Subtitle) {
         return;
     }
-    divider(ui);
-    section_label(ui, "SYNC OFFSET");
-    ui.add_space(8.0);
-    ui.add_enabled_ui(!stream.removed, |ui| {
-        ui.horizontal(|ui| {
-            widgets::offset_stepper(ui, &mut stream.offset_secs, false);
-            ui.add_space(6.0);
-            ui.label(RichText::new("step 0.05 s").size(12.0).color(theme::WEAK));
-        });
-    });
-    ui.add_space(8.0);
-    helper(ui, "+ delays this track, − plays it earlier.");
+    // Drawn into a bottom-up layout, so from the last line to the first.
     if stream.source.input == 0 && stream.has_offset() {
-        ui.add_space(4.0);
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(RichText::new(icon::INFO).size(13.0).color(theme::CHANGE_OFFSET));
             helper(ui, "The run reads the file once more to shift just this track.");
         });
+        ui.add_space(4.0);
     }
+    // One row, with the buttons' tooltips saying what ± do: beside the cue card
+    // the sections above need every line this leaves them.
+    ui.horizontal(|ui| {
+        section_label(ui, "SYNC OFFSET");
+        ui.add_space(4.0);
+        ui.add_enabled_ui(!stream.removed, |ui| {
+            widgets::offset_stepper(ui, &mut stream.offset_secs);
+        });
+    });
+    divider(ui);
 }
 
 /// STREAM DETAILS (wide windows): what's known about the source stream, as a

@@ -286,41 +286,32 @@ pub(super) fn checkbox(ui: &mut egui::Ui, value: &mut bool, indeterminate: bool,
     resp
 }
 
-/// Size of the stepper's buttons: regular in the inspector, compact in the cue card.
-fn stepper_button_size(compact: bool) -> Vec2 {
-    if compact { vec2(24.0, 22.0) } else { vec2(26.0, 24.0) }
-}
-
 /// One sync-offset step, in seconds.
 pub(super) const OFFSET_STEP: f64 = 0.05;
 
 /// The sync-offset stepper: `[−] [value] [+] [reset]`. The value is a drag
-/// field that also takes typed input; it turns teal when non-zero. Returns
-/// whether `offset` changed. Used by the inspector and the cue card, which edit
-/// the same stream field, so both always show the same number.
-pub(super) fn offset_stepper(ui: &mut egui::Ui, offset: &mut f64, compact: bool) -> bool {
+/// field that also takes typed input. Returns whether `offset` changed.
+pub(super) fn offset_stepper(ui: &mut egui::Ui, offset: &mut f64) -> bool {
     let before = *offset;
-    let size = stepper_button_size(compact);
+    let size = vec2(26.0, 24.0);
     ui.spacing_mut().item_spacing.x = 4.0;
     if ui.add_sized(size, button(icon::MINUS)).on_hover_text("Play earlier by 0.05 s").clicked() {
         *offset -= OFFSET_STEP;
     }
-    let color = if offset.abs() >= 0.0005 && compact { theme::CHANGE_OFFSET } else { theme::TEXT };
     let value = egui::DragValue::new(offset)
         .speed(0.005)
         .range(-3600.0..=3600.0)
         .custom_formatter(|v, _| format!("{v:+.3} s"))
         .custom_parser(|s| s.trim().trim_end_matches('s').trim().replace('−', "-").parse().ok());
-    let min_w = if compact { 64.0 } else { 70.0 };
     ui.scope(|ui| {
         let v = &mut ui.visuals_mut().widgets;
         for w in [&mut v.inactive, &mut v.hovered, &mut v.active] {
             w.weak_bg_fill = theme::FIELD;
-            w.fg_stroke.color = color;
+            w.fg_stroke.color = theme::TEXT;
         }
         v.inactive.bg_stroke = Stroke::new(1.0, theme::STROKE);
         ui.style_mut().override_font_id = Some(egui::FontId::monospace(12.0));
-        ui.add_sized(vec2(min_w + 14.0, size.y), value)
+        ui.add_sized(vec2(84.0, size.y), value)
             .on_hover_text("Drag, or click to type a value in seconds");
     });
     if ui.add_sized(size, button(icon::PLUS)).on_hover_text("Delay by 0.05 s").clicked() {

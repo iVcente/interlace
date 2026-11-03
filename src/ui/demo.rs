@@ -1216,9 +1216,8 @@ fn script(rec: &mut Recorder) {
     let cue = rec.widget_center(egui::Id::new("cue_row").with(3)); // the 00:01:05 cue
     rec.click(cue);
     rec.wait(1.0);
-    // Ten − steps of 0.05 s: half a second earlier. The − sits right of the card's OFFSET label.
-    let offset = rec.text_rect("OFFSET");
-    rec.click(pos2(offset.left() + 74.0, offset.center().y));
+    // Ten − steps of 0.05 s in the inspector's SYNC OFFSET: half a second earlier.
+    rec.click_label(egui_phosphor::regular::MINUS);
     for _ in 1..10 {
         rec.button(true);
         rec.wait(0.06);
