@@ -239,11 +239,6 @@ impl<'a> Recorder<'a> {
         rec
     }
 
-    /// The app under the script.
-    fn app(&mut self) -> &mut InterlaceApp {
-        &mut self.harness.state_mut().app
-    }
-
     /// Video time, in seconds.
     fn time(&self) -> f64 {
         self.frame as f64 / FPS as f64
