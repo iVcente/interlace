@@ -1975,6 +1975,43 @@ mod tests {
         assert_ne!(app.preview_picks.as_ref().unwrap().subtitle, removed);
     }
 
+    /// Hints never run under the command card: they fit when there's room, and
+    /// scroll inside what's left when the window is too short for them.
+    #[test]
+    fn hints_stay_above_the_command_card() {
+        for (w, h) in [(1440.0, 810.0), (880.0, 600.0)] {
+            let mut app = app_with_demo();
+            for _ in 0..3 {
+                push_embedded_sub(&mut app);
+            }
+            let project = app.project.as_mut().unwrap();
+            project.output = PathBuf::from("out.mp4");
+            app.show_command = true;
+            let ctx = test_ctx();
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input(), |ui| app.render(ui));
+            for _ in 0..3 {
+                out = ctx.run_ui(input(), |ui| app.render(ui));
+            }
+            let texts = || {
+                out.shapes.iter().filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) => Some((clipped.clip_rect, text)),
+                    _ => None,
+                })
+            };
+            let command_top = texts().find(|(_, t)| t.galley.job.text == "COMMAND").expect("the command card").1.pos.y;
+            let hints: Vec<_> = texts().filter(|(_, t)| t.galley.job.text.contains("MP4")).collect();
+            assert!(!hints.is_empty(), "{w}x{h}: the output has hints");
+            for (clip, text) in hints {
+                let bottom = (text.pos.y + text.galley.size().y).min(clip.max.y);
+                assert!(bottom <= command_top, "{w}x{h}: hint reaches {bottom}, the card's text starts at {command_top}");
+            }
+        }
+    }
+
     /// The dropdown's text stays put as a row turns selected or hovered: egui's
     /// selectable button adds its outline to the margin, moving the text.
     #[test]
@@ -1984,7 +2021,7 @@ mod tests {
             .map(|on| {
                 let ctx = test_ctx();
                 let out = ctx.run_ui(egui::RawInput::default(), |ui| {
-                    runbar::option_row(ui, "A0 · eng", on);
+                    widgets::option_row(ui, "A0 · eng", on);
                 });
                 out.shapes
                     .iter()

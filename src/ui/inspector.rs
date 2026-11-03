@@ -387,12 +387,12 @@ fn language_combo(ui: &mut Ui, current: Option<&Option<String>>) -> Option<Optio
                 }
                 ui.data_mut(|d| d.insert_temp(typed_id, typed));
                 ui.separator();
-                if ui.selectable_label(matches!(current, Some(None)), "unset").clicked() {
+                if widgets::option_row(ui, "unset", matches!(current, Some(None))).clicked() {
                     picked = Some(None);
                 }
                 for (code, _) in LANGUAGES {
                     let on = matches!(current, Some(Some(c)) if c == code);
-                    if ui.selectable_label(on, language_label(code)).clicked() {
+                    if widgets::option_row(ui, &language_label(code), on).clicked() {
                         picked = Some(Some(code.to_string()));
                     }
                 }
@@ -521,7 +521,7 @@ fn convert_combo(ui: &mut Ui, streams: &mut [&mut OutStream], width: f32) {
         .show_ui(ui, |ui| {
             let options = can_copy.then_some("copy").into_iter().chain(CODECS);
             for opt in options {
-                if ui.selectable_label(current.as_deref() == Some(opt), opt).clicked() {
+                if widgets::option_row(ui, opt, current.as_deref() == Some(opt)).clicked() {
                     for s in streams.iter_mut() {
                         set_codec(s, opt);
                     }
@@ -570,7 +570,7 @@ fn bitrate_combo(ui: &mut Ui, streams: &mut [&mut OutStream], width: f32) {
                         Bitrate::Default => "default".to_string(),
                         Bitrate::Fixed(b) => format!("{b}k"),
                     };
-                    if ui.selectable_label(current.as_ref() == Some(&opt), label).clicked() {
+                    if widgets::option_row(ui, &label, current.as_ref() == Some(&opt)).clicked() {
                         pick_rate = Some(opt);
                     }
                 }
@@ -608,7 +608,7 @@ fn channels_combo(ui: &mut Ui, streams: &mut [&mut OutStream], width: f32) {
             .width(width)
             .show_ui(ui, |ui| {
                 for (value, label) in CHANNELS {
-                    if ui.selectable_label(current == Some(value), label).clicked() {
+                    if widgets::option_row(ui, label, current == Some(value)).clicked() {
                         for s in streams.iter_mut() {
                             if let Encode::Audio { channels, .. } = &mut s.encode {
                                 *channels = value;

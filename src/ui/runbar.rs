@@ -455,11 +455,11 @@ fn track_picker(ui: &mut Ui, project: &Project, kind: Kind, label: &str, pick: &
                 .show_ui(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     for &row in &rows {
-                        if option_row(ui, &name(row), pick.row(project) == Some(row)).clicked() {
+                        if widgets::option_row(ui, &name(row), pick.row(project) == Some(row)).clicked() {
                             picked = Some(TrackPick::track(project, row));
                         }
                     }
-                    if option_row(ui, "None", *pick == TrackPick::Off).clicked() {
+                    if widgets::option_row(ui, "None", *pick == TrackPick::Off).clicked() {
                         picked = Some(TrackPick::Off);
                     }
                 });
@@ -469,32 +469,6 @@ fn track_picker(ui: &mut Ui, project: &Project, kind: Kind, label: &str, pick: &
     if let Some(new) = picked {
         *pick = new;
     }
-}
-
-/// A dropdown row painted at a fixed size, like the length switch's segments: an
-/// `egui::Button` also sizes itself from its outline, so its text moves as it
-/// turns selected or hovered.
-pub(super) fn option_row(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), egui::Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), on, text));
-    if ui.is_rect_visible(rect) {
-        let (fill, stroke) = match (on, resp.hovered()) {
-            (true, _) => (theme::SELECTED, theme::ACCENT),
-            (false, true) => (theme::CARD, Color32::TRANSPARENT),
-            (false, false) => (Color32::TRANSPARENT, Color32::TRANSPARENT),
-        };
-        ui.painter()
-            .rect(rect, CornerRadius::same(4), fill, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
-        let mut job = egui::text::LayoutJob::single_section(
-            text.to_string(),
-            egui::TextFormat::simple(egui::FontId::proportional(12.5), theme::TEXT),
-        );
-        job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() - 16.0);
-        let galley = ui.painter().layout_job(job);
-        let pos = egui::pos2(rect.left() + 8.0, rect.center().y - galley.size().y / 2.0);
-        ui.painter().galley(pos, galley, theme::TEXT);
-    }
-    resp
 }
 
 /// The View log window: the failed job's stderr, scrollable, with Copy.

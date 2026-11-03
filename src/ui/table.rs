@@ -29,6 +29,10 @@ const ROW_HEIGHT: f32 = 34.0;
 const HEADER_HEIGHT: f32 = 28.0;
 /// Horizontal padding inside the card, and the gap between columns.
 const PAD: f32 = 10.0;
+/// Height of a hint row's icon, the least a row takes however short its text.
+const HINT_ICON_HEIGHT: f32 = 18.0;
+/// Space under each hint; twice this separates them from the card.
+const HINT_GAP: f32 = 4.0;
 // Minimum height of the empty-state drop zone (it grows to fill the column).
 const EMPTY_HEIGHT: f32 = 220.0;
 
@@ -106,8 +110,9 @@ pub(super) fn show(ui: &mut Ui, app: &mut InterlaceApp, wide: bool) {
     // Lay the hints out first, so the card knows how much height they need and
     // the table can scroll inside the rest.
     let hints = hint_galleys(ui, app);
-    let hints_height: f32 = hints.iter().map(|(_, _, g)| g.size().y + 4.0).sum();
-    let max_card = (ui.available_height() - hints_height - if hints.is_empty() { 0.0 } else { 8.0 }).max(HEADER_HEIGHT + ROW_HEIGHT * 2.0);
+    let hints_height: f32 = hints.iter().map(|(_, _, g)| g.size().y.max(HINT_ICON_HEIGHT) + HINT_GAP).sum();
+    let reserved = if hints.is_empty() { 0.0 } else { hints_height + HINT_GAP * 2.0 + ui.spacing().item_spacing.y };
+    let max_card = (ui.available_height() - reserved).max(HEADER_HEIGHT + ROW_HEIGHT * 2.0);
 
     let cols = columns(wide);
     let mut click: Option<usize> = None;
@@ -153,15 +158,26 @@ pub(super) fn show(ui: &mut Ui, app: &mut InterlaceApp, wide: bool) {
     });
 
     if !hints.is_empty() {
-        ui.add_space(8.0);
-        for (glyph, color, galley) in hints {
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(RichText::new(glyph).size(13.5).color(color));
-                ui.add(egui::Label::new(galley));
+        ui.add_space(HINT_GAP * 2.0);
+        // The table keeps at least two rows, so a short window can leave less
+        // room than the hints need. They scroll then, rather than run under the
+        // card below.
+        egui::ScrollArea::vertical()
+            .id_salt("hints")
+            .max_height(ui.available_height().max(0.0))
+            .min_scrolled_height(0.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for (glyph, color, galley) in hints {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new(glyph).size(13.5).color(color));
+                        ui.add(egui::Label::new(galley));
+                    });
+                    ui.add_space(HINT_GAP);
+                }
             });
-            ui.add_space(4.0);
-        }
     }
 
     // Apply mutations after the immutable borrow of `app.project` ends.
